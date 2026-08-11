@@ -67,7 +67,6 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in ADMIN_USER_IDS:
         return
 
-    # Check arguments: /sendplan <client_id> <meal/workout>
     if len(context.args) < 2 or not update.message.document:
         await update.message.reply_text("Usage: Send a PDF/DOCX with caption `/sendplan <client_id> <meal|workout>`")
         return
@@ -94,7 +93,6 @@ async def admin_send_voice_feedback(update: Update, context: ContextTypes.DEFAUL
     if user_id not in ADMIN_USER_IDS:
         return
 
-    # Check command: /reply <client_id> (with attached voice note)
     if not context.args or not update.message.voice:
         await update.message.reply_text("Usage: Record a voice note with caption `/reply <client_id>`")
         return
@@ -263,85 +261,100 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
         await query.message.reply_text("🎉 <b>Check-In Completed!</b>\nYour data has been date-locked. Coach Simon will review your progress in your next check-in!", parse_mode="HTML")
 
 # ------------------------------------------------------------------
-# MEDIA & ATTACHMENT HANDLER
+# CRASH-PROOF MEDIA & TEXT HANDLER (Handles Nonsense Safely)
 # ------------------------------------------------------------------
 async def handle_client_attachments(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-
     try:
-        res = supabase.table("clients").select("package, goal, full_name").eq("id", user.id).execute()
-        client = res.data[0] if res.data else {}
-        tier = client.get("package", "Meal Plan Only")
-        goal = client.get("goal", "goal_fat_loss")
-    except Exception:
-        tier = "Meal Plan Only"
-        goal = "goal_fat_loss"
-
-    perms = TIER_PERMISSIONS.get(tier, TIER_PERMISSIONS["Meal Plan Only"])
-
-    # Media attachments (Photos/Videos/Voice)
-    if update.message.photo or update.message.video or update.message.voice:
-        if not perms["allow_media"]:
-            await update.message.reply_text(
-                "Note: Video/photo form reviews and voice note audits are reserved for Transformation Tiers. Tap below to upgrade:",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏋️ Upgrade Plan", callback_data="upgrade_tier")]]),
-            )
-            return
-
-        media_type = "photo" if update.message.photo else ("video" if update.message.video else "voice")
-        file_id = update.message.photo[-1].file_id if update.message.photo else (update.message.video.file_id if update.message.video else update.message.voice.file_id)
-
-        try:
-            supabase.table("client_media").insert({
-                "client_id": user.id,
-                "media_type": media_type,
-                "telegram_file_id": file_id,
-                "message_text": update.message.caption or ""
-            }).execute()
-        except Exception as e:
-            logging.error(f"Error saving media attachment: {e}")
-
-        await update.message.reply_text("Got it! 🎥 Your attachment has been date-locked and saved. Coach Simon will review it in your <b>next check-in</b>.", parse_mode="HTML")
-        
-        # Check if it looks like a payment receipt for tier upgrade
-        if update.message.photo and tier == "Meal Plan Only":
-             vip_alert = f"🚨 <b>NEW TIER UPGRADE RECEIPT!</b>\nClient: {user.full_name} ({user.id})\nStatus: Check attachment for payment validation."
-             for admin_id in ADMIN_USER_IDS:
-                 try:
-                     await context.bot.send_photo(chat_id=admin_id, photo=file_id, caption=vip_alert, parse_mode="HTML")
-                 except Exception:
-                     pass
-        return
-
-    # Text Notes / Questions
-    if update.message.text:
-        if not perms["allow_qa"]:
-            await update.message.reply_text(
-                "Direct Q&A access is reserved for Coaching Tier clients. Tap below to upgrade:",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏋️ Upgrade Plan", callback_data="upgrade_tier")]]),
-            )
+        user = update.effective_user
+        if not user or not update.message:
             return
 
         try:
-            supabase.table("client_media").insert({
-                "client_id": user.id,
-                "media_type": "text",
-                "message_text": update.message.text
-            }).execute()
-        except Exception as e:
-            logging.error(f"Error saving text note: {e}")
+            res = supabase.table("clients").select("package, goal, full_name").eq("id", user.id).execute()
+            client = res.data[0] if res.data and len(res.data) > 0 else {}
+            tier = client.get("package", "Meal Plan Only")
+            goal = client.get("goal", "goal_fat_loss")
+        except Exception:
+            tier = "Meal Plan Only"
+            goal = "goal_fat_loss"
 
-        if perms.get("priority"):
-            goal_label = "💪 MUSCLE BUILDING" if goal == "goal_muscle" else "🔥 FAT LOSS"
-            vip_alert = f"🚨 <b>INSTANT VIP QUESTION!</b>\nClient: {user.full_name}\nTier: {tier} ({goal_label})\nMessage: {update.message.text}"
-            for admin_id in ADMIN_USER_IDS:
-                try:
-                    await context.bot.send_message(chat_id=admin_id, text=vip_alert, parse_mode="HTML")
-                except Exception:
-                    pass
-            await update.message.reply_text("Your VIP message has been routed directly to Coach Simon for priority review!")
-        else:
-            await update.message.reply_text("Question saved! 📝 Coach Simon will address this in your <b>next check-in</b>.", parse_mode="HTML")
+        perms = TIER_PERMISSIONS.get(tier, TIER_PERMISSIONS["Meal Plan Only"])
+
+        # 1. Handle Media (Photos/Videos/Voice)
+        if update.message.photo or update.message.video or update.message.voice:
+            if not perms["allow_media"]:
+                await update.message.reply_text(
+                    "Note: Video/photo form reviews and voice note audits are reserved for Transformation Tiers. Tap below to upgrade:",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏋️ Upgrade Plan", callback_data="upgrade_tier")]]),
+                )
+                return
+
+            media_type = "photo" if update.message.photo else ("video" if update.message.video else "voice")
+            file_id = update.message.photo[-1].file_id if update.message.photo else (update.message.video.file_id if update.message.video else update.message.voice.file_id)
+
+            try:
+                supabase.table("client_media").insert({
+                    "client_id": user.id,
+                    "media_type": media_type,
+                    "telegram_file_id": file_id,
+                    "message_text": update.message.caption or ""
+                }).execute()
+            except Exception as db_err:
+                logging.error(f"Database error saving media: {db_err}")
+
+            await update.message.reply_text("Got it! 🎥 Your attachment has been date-locked and saved. Coach Simon will review it in your <b>next check-in</b>.", parse_mode="HTML")
+            
+            if update.message.photo and tier == "Meal Plan Only":
+                 vip_alert = f"🚨 <b>NEW TIER UPGRADE RECEIPT!</b>\nClient: {user.full_name} ({user.id})\nStatus: Check attachment for payment validation."
+                 for admin_id in ADMIN_USER_IDS:
+                     try:
+                         await context.bot.send_photo(chat_id=admin_id, photo=file_id, caption=vip_alert, parse_mode="HTML")
+                     except Exception:
+                         pass
+            return
+
+        # 2. Handle Text Notes / Nonsense / Questions
+        if update.message.text:
+            text_content = update.message.text.strip()
+
+            if not perms["allow_qa"]:
+                await update.message.reply_text(
+                    "Direct Q&A access is reserved for Coaching Tier clients. Tap below to upgrade:",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏋️ Upgrade Plan", callback_data="upgrade_tier")]]),
+                )
+                return
+
+            try:
+                supabase.table("client_media").insert({
+                    "client_id": user.id,
+                    "media_type": "text",
+                    "message_text": text_content
+                }).execute()
+            except Exception as db_err:
+                logging.error(f"Database error saving text: {db_err}")
+
+            if perms.get("priority"):
+                goal_label = "💪 MUSCLE BUILDING" if goal == "goal_muscle" else "🔥 FAT LOSS"
+                vip_alert = f"🚨 <b>INSTANT VIP QUESTION!</b>\nClient: {user.full_name}\nTier: {tier} ({goal_label})\nMessage: {text_content}"
+                for admin_id in ADMIN_USER_IDS:
+                    try:
+                        await context.bot.send_message(chat_id=admin_id, text=vip_alert, parse_mode="HTML")
+                    except Exception:
+                        pass
+                await update.message.reply_text("Your VIP message has been routed directly to Coach Simon for priority review!")
+            else:
+                await update.message.reply_text("Question saved! 📝 Coach Simon will address this in your <b>next check-in</b>.", parse_mode="HTML")
+
+    except Exception as e:
+        logging.error(f"Unexpected error in message handler: {e}")
+        keyboard = [
+            [InlineKeyboardButton("📖 My Target Plan", callback_data="get_target_plan")],
+            [InlineKeyboardButton("📊 Daily Check-In", callback_data="start_checkin")],
+        ]
+        await update.message.reply_text(
+            "Hmm, I didn't quite catch that! 🎯 Tap an option below to manage your journey:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 # ------------------------------------------------------------------
 # MAIN INITIALIZATION
