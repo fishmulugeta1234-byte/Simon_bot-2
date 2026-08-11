@@ -19,17 +19,21 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# Environment Variables
+# ------------------------------------------------------------------
+# ENVIRONMENT & HARDCODED CONFIGURATION
+# ------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# Admin IDs
+# Hardcoded Admin Telegram IDs for VIP Alerts
 ADMIN_USER_IDS = [1622298145, 389487101]
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Matrix permissions
+# ------------------------------------------------------------------
+# TIER PERMISSIONS DEFINITION
+# ------------------------------------------------------------------
 TIER_PERMISSIONS = {
     "Meal Plan Only": {"allow_media": False, "allow_qa": False, "priority": False},
     "Kickstart (21 Days)": {"allow_media": False, "allow_qa": True, "priority": False},
@@ -40,7 +44,7 @@ TIER_PERMISSIONS = {
 }
 
 # ------------------------------------------------------------------
-# RENDER DUMMY WEB SERVER
+# DUMMY WEB SERVER (Keeps Render Health Checks Active)
 # ------------------------------------------------------------------
 async def health_check(request):
     return web.Response(text="Server listening on port 8080 & Bot polling started.")
@@ -54,6 +58,60 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+
+# ------------------------------------------------------------------
+# ADMIN FILE & VOICE NOTE DELIVERY HANDLERS
+# ------------------------------------------------------------------
+async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        return
+
+    # Check arguments: /sendplan <client_id> <meal/workout>
+    if len(context.args) < 2 or not update.message.document:
+        await update.message.reply_text("Usage: Send a PDF/DOCX with caption `/sendplan <client_id> <meal|workout>`")
+        return
+
+    target_client_id = context.args[0]
+    plan_type = context.args[1].lower()
+    file_id = update.message.document.file_id
+    col_name = "meal_plan_url" if plan_type == "meal" else "workout_plan_url"
+
+    try:
+        supabase.table("clients").update({col_name: file_id}).eq("id", target_client_id).execute()
+        
+        await context.bot.send_message(
+            chat_id=target_client_id,
+            text=f"🎉 <b>New {plan_type.capitalize()} Plan Updated!</b>\nCoach Simon has uploaded your new plan. Tap 📖 My Target Plan to download it!",
+            parse_mode="HTML"
+        )
+        await update.message.reply_text("✅ Plan successfully updated and sent to the client!")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Failed to update plan: {e}")
+
+async def admin_send_voice_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        return
+
+    # Check command: /reply <client_id> (with attached voice note)
+    if not context.args or not update.message.voice:
+        await update.message.reply_text("Usage: Record a voice note with caption `/reply <client_id>`")
+        return
+
+    target_client_id = context.args[0]
+    voice_file_id = update.message.voice.file_id
+
+    try:
+        await context.bot.send_voice(
+            chat_id=target_client_id,
+            voice=voice_file_id,
+            caption="🎙️ <b>Voice Feedback from Coach Simon</b>",
+            parse_mode="HTML"
+        )
+        await update.message.reply_text("✅ Voice note delivered to client!")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Failed to deliver voice note: {e}")
 
 # ------------------------------------------------------------------
 # BOT COMMANDS & CALLBACKS
@@ -96,6 +154,43 @@ async def handle_target_plan(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.message.reply_text("⚠️ Database error fetching your plan.")
 
 # ------------------------------------------------------------------
+# UPGRADE FLOW HANDLERS
+# ------------------------------------------------------------------
+async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [InlineKeyboardButton("🔥 Transformation (60 Days)", callback_data="upgrade_60day")],
+        [InlineKeyboardButton("⚡ Elite Transformation (90 Days)", callback_data="upgrade_90day")],
+        [InlineKeyboardButton("📲 Contact Coach Simon", url="https://t.me/s_simon_19")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.message.reply_text(
+        "🏋️ <b>UPGRADE TO FULL COACHING</b>\n\n"
+        "Unlock full 1-on-1 coaching, exercise form reviews, voice note audits, and workout plans!\n\n"
+        "Select your tier to view payment options:",
+        reply_markup=reply_markup,
+        parse_mode="HTML"
+    )
+
+async def handle_upgrade_payment_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    selected_tier = "60 Days Transformation" if query.data == "upgrade_60day" else "90 Days Elite Transformation"
+
+    text = (
+        f"💳 <b>UPGRADE TO {selected_tier.upper()}</b>\n\n"
+        "To complete your upgrade, transfer the fee via:\n"
+        "• <b>CBE:</b> 1000357796532 (Simon Mulugeta)\n"
+        "• <b>Telebirr:</b> 0939998090 (Simon Mulugeta)\n\n"
+        "📸 <b>Next Step:</b> Send a screenshot of your transfer receipt directly to this chat!"
+    )
+    await query.message.reply_text(text, parse_mode="HTML")
+
+# ------------------------------------------------------------------
 # DYNAMIC FAT LOSS VS MUSCLE CHECK-IN FLOW
 # ------------------------------------------------------------------
 async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,7 +198,6 @@ async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     user_id = query.from_user.id
 
-    # Get Client Goal
     try:
         res = supabase.table("clients").select("goal").eq("id", user_id).execute()
         goal = res.data[0].get("goal", "goal_fat_loss") if res.data else "goal_fat_loss"
@@ -135,7 +229,6 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
         status = "Hit" if data == "log_nut_hit" else "Missed"
         context.user_data["checkin_nut"] = status
 
-        # Hydration / Sleep Question
         res = supabase.table("clients").select("goal").eq("id", user_id).execute()
         goal = res.data[0].get("goal", "goal_fat_loss") if res.data else "goal_fat_loss"
 
@@ -158,7 +251,6 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
         second_status = "Hit" if data == "log_second_hit" else "Missed"
         nut_status = context.user_data.get("checkin_nut", "Logged")
 
-        # Save Check-in Log
         try:
             supabase.table("daily_logs").insert({
                 "client_id": user_id,
@@ -176,7 +268,6 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
 async def handle_client_attachments(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
-    # Fetch Client Tier and Goal
     try:
         res = supabase.table("clients").select("package, goal, full_name").eq("id", user.id).execute()
         client = res.data[0] if res.data else {}
@@ -211,6 +302,15 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
             logging.error(f"Error saving media attachment: {e}")
 
         await update.message.reply_text("Got it! 🎥 Your attachment has been date-locked and saved. Coach Simon will review it in your <b>next check-in</b>.", parse_mode="HTML")
+        
+        # Check if it looks like a payment receipt for tier upgrade
+        if update.message.photo and tier == "Meal Plan Only":
+             vip_alert = f"🚨 <b>NEW TIER UPGRADE RECEIPT!</b>\nClient: {user.full_name} ({user.id})\nStatus: Check attachment for payment validation."
+             for admin_id in ADMIN_USER_IDS:
+                 try:
+                     await context.bot.send_photo(chat_id=admin_id, photo=file_id, caption=vip_alert, parse_mode="HTML")
+                 except Exception:
+                     pass
         return
 
     # Text Notes / Questions
@@ -253,10 +353,23 @@ def main():
     persistence = PicklePersistence(filepath="bot_persistence")
     app = ApplicationBuilder().token(BOT_TOKEN).persistence(persistence).post_init(post_init).build()
 
+    # Base Commands
     app.add_handler(CommandHandler("start", start_command))
+    
+    # Admin Commands (File & Voice Note Delivery)
+    app.add_handler(CommandHandler("sendplan", admin_send_plan))
+    app.add_handler(CommandHandler("reply", admin_send_voice_feedback))
+    
+    # Button Callbacks
     app.add_handler(CallbackQueryHandler(handle_target_plan, pattern="^get_target_plan$"))
     app.add_handler(CallbackQueryHandler(trigger_daily_checkin, pattern="^start_checkin$"))
     app.add_handler(CallbackQueryHandler(handle_checkin_responses, pattern="^log_"))
+    
+    # Upgrade Callbacks
+    app.add_handler(CallbackQueryHandler(handle_upgrade_button, pattern="^upgrade_tier$"))
+    app.add_handler(CallbackQueryHandler(handle_upgrade_payment_info, pattern="^upgrade_60day$|^upgrade_90day$"))
+    
+    # Media & Text Handlers
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_client_attachments))
 
     print("⚡ Bot #2 (Simon Tracking & Coaching Portal) is live on Render...")
