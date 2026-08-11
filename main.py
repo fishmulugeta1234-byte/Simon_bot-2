@@ -5,9 +5,7 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters
+    ContextTypes
 )
 from supabase import create_client, Client
 
@@ -40,7 +38,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles inline button clicks and fetches files from Supabase."""
+    """Handles inline button clicks and fetches links/files from Supabase."""
     query = update.callback_query
     await query.answer()
     
@@ -48,8 +46,13 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
     data = query.data
 
     # Query Supabase for the client's row matching their Telegram User ID
-    response = supabase.table("clients").select("*").eq("id", user_id).execute()
-    records = response.data
+    try:
+        response = supabase.table("clients").select("*").eq("id", user_id).execute()
+        records = response.data
+    except Exception as e:
+        logging.error(f"Database error: {e}")
+        await query.message.reply_text("⚠️ Database error occurred. Please try again later.")
+        return
 
     if not records:
         await query.message.reply_text(
@@ -77,26 +80,13 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.message.reply_text("📝 To log your progress, send your update directly in this chat!")
 
 async def send_plan_file(query, file_identifier: str, caption_text: str):
-    """Sends a document whether it's a Telegram file_id or a web link."""
+    """Sends a document if it's a Telegram file_id or a link message if it's a web URL."""
     try:
-        # Tries sending directly as a Telegram document (file_id)
+        # Tries sending directly as a Telegram document (if file_id was used)
         await query.message.reply_document(document=file_identifier, caption=caption_text)
     except Exception:
-        # If it's a web URL, sends it as a clickable link message instead
-        await query.message.reply_text(f"{caption_text}\n{file_identifier}")
-
-async def get_file_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Replies with your Telegram User ID and the File ID of any sent PDF/document."""
-    user_id = update.message.from_user.id
-    file_id = update.message.document.file_id
-    
-    response_text = (
-        f"✅ **Document Received!**\n\n"
-        f"👤 **Your Telegram ID:**\n`{user_id}`\n\n"
-        f"📄 **Your File ID:**\n`{file_id}`\n\n"
-        f"👉 Copy these numbers/strings into your Supabase SQL query!"
-    )
-    await update.message.reply_text(response_text, parse_mode="Markdown")
+        # Fallback for standard web links (Google Drive, Supabase Storage URL, etc.)
+        await query.message.reply_text(f"{caption_text}\n\n🔗 {file_identifier}")
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -104,8 +94,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_button_click))
     
-    # Catch any document/PDF uploaded to the bot chat
-    app.add_handler(MessageHandler(filters.Document.ALL, get_file_id_handler))
-    
-    print("Bot running...")
+    print("Bot is running...")
     app.run_polling()
