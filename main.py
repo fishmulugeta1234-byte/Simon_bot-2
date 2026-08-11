@@ -1,5 +1,7 @@
 import os
 import logging
+import asyncio
+from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -19,6 +21,7 @@ logging.basicConfig(
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+PORT = int(os.getenv("PORT", 8080))
 
 # Initialize Supabase Client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -45,7 +48,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = query.from_user.id
     data = query.data
 
-    # Query Supabase for the client's row matching their Telegram User ID
     try:
         response = supabase.table("clients").select("*").eq("id", user_id).execute()
         records = response.data
@@ -82,17 +84,42 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def send_plan_file(query, file_identifier: str, caption_text: str):
     """Sends a document if it's a Telegram file_id or a link message if it's a web URL."""
     try:
-        # Tries sending directly as a Telegram document (if file_id was used)
         await query.message.reply_document(document=file_identifier, caption=caption_text)
     except Exception:
-        # Fallback for standard web links (Google Drive, Supabase Storage URL, etc.)
         await query.message.reply_text(f"{caption_text}\n\n🔗 {file_identifier}")
 
-if __name__ == "__main__":
+# Dummy HTTP health check handler for Render port binding
+async def health_check(request):
+    return web.Response(text="Bot is live!")
+
+async def main():
+    # Build Telegram Bot App
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_button_click))
-    
-    print("Bot is running...")
-    app.run_polling()
+
+    # Build HTTP Server for Render to satisfy health checks
+    web_app = web.Application()
+    web_app.router.add_get("/", health_check)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+
+    # Start both the web server and polling loop
+    await site.start()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+
+    logging.info(f"Server listening on port {PORT} & Bot polling started.")
+
+    # Keep application running continuously
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await runner.cleanup()
+
+if __name__ == "__main__":
+    asyncio.run(main())
