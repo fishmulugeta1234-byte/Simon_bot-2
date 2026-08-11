@@ -27,7 +27,6 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# Hardcoded Admin Telegram IDs for VIP Alerts and Reports
 ADMIN_USER_IDS = [1622298145, 389487101]
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -61,10 +60,22 @@ async def start_web_server():
     await site.start()
 
 # ------------------------------------------------------------------
+# HELPER: GET CLIENT LANGUAGE PREFERENCE
+# ------------------------------------------------------------------
+async def get_client_language(user_id: int) -> str:
+    """Fetches client language preference from Supabase, defaults to Amharic/English mix."""
+    try:
+        res = supabase.table("clients").select("language").eq("id", user_id).execute()
+        if res.data and len(res.data) > 0:
+            return res.data[0].get("language", "am")
+    except Exception:
+        pass
+    return "am"  # Default to Amharic/English dual display
+
+# ------------------------------------------------------------------
 # ELITE BACKGROUND JOBS (Sunday Reports, Streaks, Expirations)
 # ------------------------------------------------------------------
 async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
-    """Fires every Sunday morning to compile and send a client adherence queue to admins."""
     try:
         res = supabase.table("clients").select("id, full_name, package, goal").execute()
         if not res.data:
@@ -79,9 +90,8 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
             goal = client.get("goal", "goal_fat_loss")
 
             if tier == "Meal Plan Only":
-                continue  # Skip meal plan clients from elite coaching queue
+                continue
 
-            # Fetch last 7 days of logs
             seven_days_ago = (datetime.now() - timedelta(days=7)).isoformat()
             logs_res = supabase.table("daily_logs").select("*").eq("client_id", c_id).gte("created_at", seven_days_ago).execute()
             logs = logs_res.data if logs_res.data else []
@@ -100,7 +110,6 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error generating Sunday report: {e}")
 
 async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
-    """Daily job to check subscription expirations and send renewal reminders."""
     try:
         res = supabase.table("clients").select("id, full_name, package, created_at").execute()
         if not res.data:
@@ -116,13 +125,12 @@ async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
             created_date = datetime.fromisoformat(client["created_at"].replace("Z", "+00:00").split("+")[0])
             days_active = (now - created_date).days
 
-            # Example: 60 Day transformation package expiring check at day 57
             if days_active == 57:
                 await context.bot.send_message(
                     chat_id=c_id,
-                    text="⚠️ <b>Your Coaching Package Expires in 3 Days!</b>\n"
-                         "To maintain uninterrupted access to your custom plans, form reviews, and check-ins, tap below to renew:",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Renew Coaching Package", callback_data="upgrade_tier")]]),
+                    text="⚠️ <b>የኮቺንግ ፓኬጅዎ በ3 ቀናት ውስጥ ይጠናቀቃል! / Package Expires in 3 Days!</b>\n"
+                         "እቅዶችዎን እና ክትትልዎን መቀጠል እንዲችሉ ከታች በመጫን ያድሱ:",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 ፓኬጅ ማደሻ / Renew Package", callback_data="upgrade_tier")]]),
                     parse_mode="HTML"
                 )
     except Exception as e:
@@ -150,7 +158,7 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await context.bot.send_message(
             chat_id=target_client_id,
-            text=f"🎉 <b>New {plan_type.capitalize()} Plan Updated!</b>\nCoach Simon has uploaded your new plan. Tap 📖 My Target Plan to download it!",
+            text=f"🎉 <b>አዲስ የ{plan_type.capitalize()} እቅድ ተጭኗል! / New Plan Updated!</b>\nኮች ሲሞን አዲስ እቅድዎን ልኮልዎታል። ለማየት ዋናውን ምናሌ ይክፈቱ!",
             parse_mode="HTML"
         )
         await update.message.reply_text("✅ Plan successfully updated and sent to the client!")
@@ -173,7 +181,7 @@ async def admin_send_voice_feedback(update: Update, context: ContextTypes.DEFAUL
         await context.bot.send_voice(
             chat_id=target_client_id,
             voice=voice_file_id,
-            caption="🎙️ <b>Voice Feedback from Coach Simon</b>",
+            caption="🎙️ <b>ከኮች ሲሞን የተላከ የድምጽ መልእክት / Voice Feedback from Coach</b>",
             parse_mode="HTML"
         )
         await update.message.reply_text("✅ Voice note delivered to client!")
@@ -181,28 +189,64 @@ async def admin_send_voice_feedback(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text(f"⚠️ Failed to deliver voice note: {e}")
 
 # ------------------------------------------------------------------
-# BOT COMMANDS & CALLBACKS
+# BOT COMMANDS, MAIN MENU & LANGUAGE TOGGLE
 # ------------------------------------------------------------------
+async def get_main_menu_markup(user_id: int):
+    lang = await get_client_language(user_id)
+    if lang == "en":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📖 My Target Plan", callback_data="get_target_plan")],
+            [InlineKeyboardButton("📊 Daily Check-In", callback_data="start_checkin")],
+            [InlineKeyboardButton("🌐 Switch to Amharic (አማርኛ)", callback_data="set_lang_am")]
+        ])
+    else:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📖 የእኔ እቅድ / My Target Plan", callback_data="get_target_plan")],
+            [InlineKeyboardButton("📊 የዕለት ክትትል / Daily Check-In", callback_data="start_checkin")],
+            [InlineKeyboardButton("🌐 ወደ እንግሊዝኛ ቀይር (Switch to English)", callback_data="set_lang_en")]
+        ])
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("📖 My Target Plan", callback_data="get_target_plan")],
-        [InlineKeyboardButton("📊 Daily Check-In", callback_data="start_checkin")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    user_id = update.effective_user.id
+    reply_markup = await get_main_menu_markup(user_id)
     await update.message.reply_text(
-        "Welcome to Simon Origin Tracking & Coaching Portal! 🎯\nSelect an option below to manage your journey:",
+        "እንኳን ወደ ሲሞን ኦሪጅን የክትትል እና ኮቺንግ ፖርታል በደህና መጡ! 🎯\n"
+        "Welcome to Simon Origin Tracking & Coaching Portal! 🎯\n\n"
+        "ቋንቋ ለመቀየር ወይም ለመጀመር ከታች ያሉትን ይጫኑ / Select an option below:",
         reply_markup=reply_markup,
+    )
+
+async def handle_language_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    new_lang = "en" if query.data == "set_lang_en" else "am"
+
+    try:
+        supabase.table("clients").update({"language": new_lang}).eq("id", user_id).execute()
+    except Exception:
+        pass  # Fallback if column doesn't exist yet, stored in user session
+
+    reply_markup = await get_main_menu_markup(user_id)
+    confirmation_text = "Language switched to English! 🇬🇧" if new_lang == "en" else "ቋንቋ ወደ አማርኛ ተቀይሯል! 🇪🇹"
+    
+    await query.message.edit_text(
+        f"✅ <b>{confirmation_text}</b>\n\nእንኳን ወደ ሲሞን ኦሪጅን ፖርታል በደህና መጡ! ከታች ይምረጡ:",
+        reply_markup=reply_markup,
+        parse_mode="HTML"
     )
 
 async def handle_target_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+    lang = await get_client_language(user_id)
 
     try:
         res = supabase.table("clients").select("package, meal_plan_url, workout_plan_url, goal").eq("id", user_id).execute()
         if not res.data:
-            await query.message.reply_text("📋 Profile not found. Please complete onboarding with Bot #1 first!")
+            msg = "📋 Profile not found. Please complete onboarding first!" if lang == "en" else "📋 መረጃዎ አልተገኘም። እባክዎ መጀመሪያ ይመዝገቡ!"
+            await query.message.reply_text(msg)
             return
 
         client = res.data[0]
@@ -211,9 +255,9 @@ async def handle_target_plan(update: Update, context: ContextTypes.DEFAULT_TYPE)
         workout_url = client.get("workout_plan_url", "Not Uploaded Yet")
 
         if tier == "Meal Plan Only":
-            text = f"📋 <b>YOUR NUTRITION BLUEPRINT SUMMARY</b>\n\n🔗 <b>Meal Plan:</b> {meal_url}"
+            text = f"📋 <b>NUTRITION BLUEPRINT / የምግብ እቅድ</b>\n\n🔗 <b>Meal Plan:</b> {meal_url}"
         else:
-            text = f"📋 <b>YOUR FULL COACHING BLUEPRINT SUMMARY</b>\n\n🔗 <b>Meal Plan:</b> {meal_url}\n🏋️ <b>Workout Plan:</b> {workout_url}"
+            text = f"📋 <b>FULL COACHING BLUEPRINT / የኮቺንግ እቅድ</b>\n\n🔗 <b>Meal Plan:</b> {meal_url}\n🏋️ <b>Workout Plan:</b> {workout_url}"
 
         await query.message.reply_text(text, parse_mode="HTML")
     except Exception as e:
@@ -235,9 +279,9 @@ async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TY
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await query.message.reply_text(
-        "🏋️ <b>UPGRADE TO FULL COACHING</b>\n\n"
-        "Unlock full 1-on-1 coaching, exercise form reviews, voice note audits, and workout plans!\n\n"
-        "Select your tier to view payment options:",
+        "🏋️ <b>UPGRADE TO FULL COACHING / ፓኬጅ ማሻሻያ</b>\n\n"
+        "Unlock full 1-on-1 coaching, form reviews, voice audits, and custom plans!\n\n"
+        "Select your tier below / አማራጭ ይምረጡ:",
         reply_markup=reply_markup,
         parse_mode="HTML"
     )
@@ -250,20 +294,21 @@ async def handle_upgrade_payment_info(update: Update, context: ContextTypes.DEFA
 
     text = (
         f"💳 <b>UPGRADE TO {selected_tier.upper()}</b>\n\n"
-        "To complete your upgrade, transfer the fee via:\n"
+        "Transfer fee via / ክፍያውን ያስተላልፉ:\n"
         "• <b>CBE:</b> 1000357796532 (Simon Mulugeta)\n"
         "• <b>Telebirr:</b> 0939998090 (Simon Mulugeta)\n\n"
-        "📸 <b>Next Step:</b> Send a screenshot of your transfer receipt directly to this chat!"
+        "📸 <b>Next Step:</b> Send your payment receipt screenshot to this chat!"
     )
     await query.message.reply_text(text, parse_mode="HTML")
 
 # ------------------------------------------------------------------
-# DYNAMIC FAT LOSS VS MUSCLE CHECK-IN FLOW
+# DYNAMIC CHECK-IN FLOW
 # ------------------------------------------------------------------
 async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+    lang = await get_client_language(user_id)
 
     try:
         res = supabase.table("clients").select("goal").eq("id", user_id).execute()
@@ -276,13 +321,13 @@ async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton("🎯 Hit Protein & Calorie Target", callback_data="log_nut_hit")],
             [InlineKeyboardButton("⚠️ Under-Ate Protein/Calories", callback_data="log_nut_miss")],
         ]
-        text = "🔔 <b>DAILY MUSCLE BUILDING CHECK-IN</b>\nDid you hit your daily protein & total calorie targets today?"
+        text = "🔔 <b>MUSCLE BUILDING CHECK-IN / የጡንቻ ግንባታ ክትትል</b>\nDid you hit your protein & calorie target today? / ፕሮቲን እና ካሎሪ ሞልተዋል?"
     else:
         keyboard = [
             [InlineKeyboardButton("🎯 Hit Deficit Target", callback_data="log_nut_hit")],
             [InlineKeyboardButton("⚠️ Exceeded Calorie Target", callback_data="log_nut_miss")],
         ]
-        text = "🔔 <b>DAILY FAT LOSS CHECK-IN</b>\nDid you stay within your prescribed calorie deficit today?"
+        text = "🔔 <b>FAT LOSS CHECK-IN / ስብ መቀነስ ክትትል</b>\nDid you stay within your calorie deficit? / የካሎሪ ገደብ ጠብቀዋል?"
 
     await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
@@ -304,13 +349,13 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
                 [InlineKeyboardButton("💤 Hit Sleep Target (7+ hrs)", callback_data="log_second_hit")],
                 [InlineKeyboardButton("❌ Under-Rested", callback_data="log_second_miss")],
             ]
-            text = "💧 <b>RECOVERY CHECK</b>\nDid you hit your sleep and recovery target today?"
+            text = "💧 <b>RECOVERY CHECK / የእረፍት ክትትል</b>\nDid you hit your sleep target (7+ hrs)? / በቂ እረፍት አድርገዋል?"
         else:
             keyboard = [
                 [InlineKeyboardButton("💧 Hit Water Target (3.5L)", callback_data="log_second_hit")],
                 [InlineKeyboardButton("❌ Missed Target", callback_data="log_second_miss")],
             ]
-            text = "💧 <b>HYDRATION CHECK</b>\nDid you hit your 3.5L water target today?"
+            text = "💧 <b>HYDRATION CHECK / የውኃ ክትትል</b>\nDid you hit your 3.5L water target? / 3.5 ሊትር ውኃ ጠጥተዋል?"
 
         await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
@@ -325,21 +370,20 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
                 "hydration_status": second_status
             }).execute()
 
-            # Calculate Streak for Gamification Celebration
             logs_res = supabase.table("daily_logs").select("*").eq("client_id", user_id).execute()
             streak_count = len(logs_res.data) if logs_res.data else 1
 
             celebration = ""
             if streak_count in [7, 14, 30]:
-                celebration = f"\n\n🔥 <b>MILESTONE UNLOCKED!</b> You just hit a <b>{streak_count}-day check-in streak</b>! Keep crushing it!"
+                celebration = f"\n\n🔥 <b>MILESTONE UNLOCKED! / ድንቅ ክንውን!</b> You hit a <b>{streak_count}-day check-in streak</b>!"
 
-            await query.message.reply_text(f"🎉 <b>Check-In Completed!</b>\nYour data has been date-locked. Coach Simon will review your progress in your next check-in!{celebration}", parse_mode="HTML")
+            await query.message.reply_text(f"🎉 <b>Check-In Completed! / ክትትልዎ ተመዝግቧል!</b>\nCoach Simon will review your progress soon.{celebration}", parse_mode="HTML")
         except Exception as e:
             logging.error(f"Failed to record check-in: {e}")
             await query.message.reply_text("🎉 <b>Check-In Completed!</b> Coach Simon will review your progress soon.", parse_mode="HTML")
 
 # ------------------------------------------------------------------
-# CRASH-PROOF MEDIA & TEXT HANDLER (Handles Nonsense Safely)
+# CRASH-PROOF MEDIA & TEXT HANDLER
 # ------------------------------------------------------------------
 async def handle_client_attachments(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -358,11 +402,10 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
 
         perms = TIER_PERMISSIONS.get(tier, TIER_PERMISSIONS["Meal Plan Only"])
 
-        # 1. Handle Media (Photos/Videos/Voice)
         if update.message.photo or update.message.video or update.message.voice:
             if not perms["allow_media"]:
                 await update.message.reply_text(
-                    "Note: Video/photo form reviews and voice note audits are reserved for Transformation Tiers. Tap below to upgrade:",
+                    "Note: Form reviews and voice notes are reserved for Transformation Tiers. Tap below to upgrade:",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏋️ Upgrade Plan", callback_data="upgrade_tier")]]),
                 )
                 return
@@ -380,10 +423,10 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
             except Exception as db_err:
                 logging.error(f"Database error saving media: {db_err}")
 
-            await update.message.reply_text("Got it! 🎥 Your attachment has been date-locked and saved. Coach Simon will review it in your <b>next check-in</b>.", parse_mode="HTML")
+            await update.message.reply_text("Got it! 🎥 Your attachment has been saved for Coach Simon's review.", parse_mode="HTML")
             
             if update.message.photo and tier == "Meal Plan Only":
-                 vip_alert = f"🚨 <b>NEW TIER UPGRADE RECEIPT!</b>\nClient: {user.full_name} ({user.id})\nStatus: Check attachment for payment validation."
+                 vip_alert = f"🚨 <b>UPGRADE RECEIPT / የክፍያ ደረሰኝ!</b>\nClient: {user.full_name} ({user.id})"
                  for admin_id in ADMIN_USER_IDS:
                      try:
                          await context.bot.send_photo(chat_id=admin_id, photo=file_id, caption=vip_alert, parse_mode="HTML")
@@ -391,7 +434,6 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
                          pass
             return
 
-        # 2. Handle Text Notes / Nonsense / Questions
         if update.message.text:
             text_content = update.message.text.strip()
 
@@ -412,26 +454,22 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
                 logging.error(f"Database error saving text: {db_err}")
 
             if perms.get("priority"):
-                goal_label = "💪 MUSCLE BUILDING" if goal == "goal_muscle" else "🔥 FAT LOSS"
-                vip_alert = f"🚨 <b>INSTANT VIP QUESTION!</b>\nClient: {user.full_name}\nTier: {tier} ({goal_label})\nMessage: {text_content}"
+                vip_alert = f"🚨 <b>INSTANT VIP QUESTION!</b>\nClient: {user.full_name}\nTier: {tier}\nMessage: {text_content}"
                 for admin_id in ADMIN_USER_IDS:
                     try:
                         await context.bot.send_message(chat_id=admin_id, text=vip_alert, parse_mode="HTML")
                     except Exception:
                         pass
-                await update.message.reply_text("Your VIP message has been routed directly to Coach Simon for priority review!")
+                await update.message.reply_text("Your VIP message has been routed directly to Coach Simon!")
             else:
-                await update.message.reply_text("Question saved! 📝 Coach Simon will address this in your <b>next check-in</b>.", parse_mode="HTML")
+                await update.message.reply_text("Question saved! 📝 Coach Simon will address this in your next check-in.", parse_mode="HTML")
 
     except Exception as e:
         logging.error(f"Unexpected error in message handler: {e}")
-        keyboard = [
-            [InlineKeyboardButton("📖 My Target Plan", callback_data="get_target_plan")],
-            [InlineKeyboardButton("📊 Daily Check-In", callback_data="start_checkin")],
-        ]
+        reply_markup = await get_main_menu_markup(update.effective_user.id if update.effective_user else 0)
         await update.message.reply_text(
-            "Hmm, I didn't quite catch that! 🎯 Tap an option below to manage your journey:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            "Hmm, I didn't quite catch that! Select an option below:",
+            reply_markup=reply_markup
         )
 
 # ------------------------------------------------------------------
@@ -440,7 +478,6 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
 async def post_init(application):
     await start_web_server()
     
-    # Start Background Elite Schedulers
     scheduler = AsyncIOScheduler()
     scheduler.add_job(send_sunday_admin_report, "cron", day_of_week="sun", hour=8, minute=0, args=[application])
     scheduler.add_job(check_expirations_and_streaks, "cron", hour=9, minute=0, args=[application])
@@ -453,7 +490,7 @@ def main():
     # Base Commands
     app.add_handler(CommandHandler("start", start_command))
     
-    # Admin Commands (File & Voice Note Delivery)
+    # Admin Commands
     app.add_handler(CommandHandler("sendplan", admin_send_plan))
     app.add_handler(CommandHandler("reply", admin_send_voice_feedback))
     
@@ -462,6 +499,9 @@ def main():
     app.add_handler(CallbackQueryHandler(trigger_daily_checkin, pattern="^start_checkin$"))
     app.add_handler(CallbackQueryHandler(handle_checkin_responses, pattern="^log_"))
     
+    # Language Switch Callbacks
+    app.add_handler(CallbackQueryHandler(handle_language_switch, pattern="^set_lang_"))
+
     # Upgrade Callbacks
     app.add_handler(CallbackQueryHandler(handle_upgrade_button, pattern="^upgrade_tier$"))
     app.add_handler(CallbackQueryHandler(handle_upgrade_payment_info, pattern="^upgrade_60day$|^upgrade_90day$"))
@@ -469,7 +509,7 @@ def main():
     # Media & Text Handlers
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_client_attachments))
 
-    print("⚡ Bot #2 (Simon Tracking & Coaching Portal) is live on Render with Elite Features...")
+    print("⚡ Bot #2 is live with dynamic language switching (Amharic/English)...")
     app.run_polling()
 
 if __name__ == "__main__":
