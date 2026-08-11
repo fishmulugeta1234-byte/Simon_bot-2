@@ -1,6 +1,6 @@
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -13,6 +13,7 @@ from telegram.ext import (
     filters,
 )
 from supabase import create_client, Client
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -26,7 +27,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# Hardcoded Admin Telegram IDs for VIP Alerts
+# Hardcoded Admin Telegram IDs for VIP Alerts and Reports
 ADMIN_USER_IDS = [1622298145, 389487101]
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -58,6 +59,74 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+
+# ------------------------------------------------------------------
+# ELITE BACKGROUND JOBS (Sunday Reports, Streaks, Expirations)
+# ------------------------------------------------------------------
+async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
+    """Fires every Sunday morning to compile and send a client adherence queue to admins."""
+    try:
+        res = supabase.table("clients").select("id, full_name, package, goal").execute()
+        if not res.data:
+            return
+
+        report_lines = ["📥 <b>WEEKLY REVIEW QUEUE FOR COACH SIMON</b>\n"]
+        
+        for client in res.data:
+            c_id = client["id"]
+            name = client.get("full_name", "Client")
+            tier = client.get("package", "Meal Plan Only")
+            goal = client.get("goal", "goal_fat_loss")
+
+            if tier == "Meal Plan Only":
+                continue  # Skip meal plan clients from elite coaching queue
+
+            # Fetch last 7 days of logs
+            seven_days_ago = (datetime.now() - timedelta(days=7)).isoformat()
+            logs_res = supabase.table("daily_logs").select("*").eq("client_id", c_id).gte("created_at", seven_days_ago).execute()
+            logs = logs_res.data if logs_res.data else []
+            streak = len(logs)
+
+            goal_icon = "💪" if goal == "goal_muscle" else "🔥"
+            report_lines.append(f"{goal_icon} <b>{name}</b> ({tier})\n• Adherence: {streak} / 7 Days Logged\n")
+
+        full_report = "\n".join(report_lines)
+        for admin_id in ADMIN_USER_IDS:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=full_report, parse_mode="HTML")
+            except Exception:
+                pass
+    except Exception as e:
+        logging.error(f"Error generating Sunday report: {e}")
+
+async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
+    """Daily job to check subscription expirations and send renewal reminders."""
+    try:
+        res = supabase.table("clients").select("id, full_name, package, created_at").execute()
+        if not res.data:
+            return
+
+        now = datetime.now()
+        for client in res.data:
+            c_id = client["id"]
+            tier = client.get("package", "Meal Plan Only")
+            if tier == "Meal Plan Only":
+                continue
+
+            created_date = datetime.fromisoformat(client["created_at"].replace("Z", "+00:00").split("+")[0])
+            days_active = (now - created_date).days
+
+            # Example: 60 Day transformation package expiring check at day 57
+            if days_active == 57:
+                await context.bot.send_message(
+                    chat_id=c_id,
+                    text="⚠️ <b>Your Coaching Package Expires in 3 Days!</b>\n"
+                         "To maintain uninterrupted access to your custom plans, form reviews, and check-ins, tap below to renew:",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Renew Coaching Package", callback_data="upgrade_tier")]]),
+                    parse_mode="HTML"
+                )
+    except Exception as e:
+        logging.error(f"Error checking expirations: {e}")
 
 # ------------------------------------------------------------------
 # ADMIN FILE & VOICE NOTE DELIVERY HANDLERS
@@ -255,10 +324,19 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
                 "nutrition_status": nut_status,
                 "hydration_status": second_status
             }).execute()
+
+            # Calculate Streak for Gamification Celebration
+            logs_res = supabase.table("daily_logs").select("*").eq("client_id", user_id).execute()
+            streak_count = len(logs_res.data) if logs_res.data else 1
+
+            celebration = ""
+            if streak_count in [7, 14, 30]:
+                celebration = f"\n\n🔥 <b>MILESTONE UNLOCKED!</b> You just hit a <b>{streak_count}-day check-in streak</b>! Keep crushing it!"
+
+            await query.message.reply_text(f"🎉 <b>Check-In Completed!</b>\nYour data has been date-locked. Coach Simon will review your progress in your next check-in!{celebration}", parse_mode="HTML")
         except Exception as e:
             logging.error(f"Failed to record check-in: {e}")
-
-        await query.message.reply_text("🎉 <b>Check-In Completed!</b>\nYour data has been date-locked. Coach Simon will review your progress in your next check-in!", parse_mode="HTML")
+            await query.message.reply_text("🎉 <b>Check-In Completed!</b> Coach Simon will review your progress soon.", parse_mode="HTML")
 
 # ------------------------------------------------------------------
 # CRASH-PROOF MEDIA & TEXT HANDLER (Handles Nonsense Safely)
@@ -357,10 +435,16 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
         )
 
 # ------------------------------------------------------------------
-# MAIN INITIALIZATION
+# MAIN INITIALIZATION & APSCHEDULER WIRING
 # ------------------------------------------------------------------
 async def post_init(application):
     await start_web_server()
+    
+    # Start Background Elite Schedulers
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(send_sunday_admin_report, "cron", day_of_week="sun", hour=8, minute=0, args=[application])
+    scheduler.add_job(check_expirations_and_streaks, "cron", hour=9, minute=0, args=[application])
+    scheduler.start()
 
 def main():
     persistence = PicklePersistence(filepath="bot_persistence")
@@ -385,7 +469,7 @@ def main():
     # Media & Text Handlers
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_client_attachments))
 
-    print("⚡ Bot #2 (Simon Tracking & Coaching Portal) is live on Render...")
+    print("⚡ Bot #2 (Simon Tracking & Coaching Portal) is live on Render with Elite Features...")
     app.run_polling()
 
 if __name__ == "__main__":
