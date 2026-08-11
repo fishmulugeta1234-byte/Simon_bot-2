@@ -14,35 +14,33 @@ from telegram.ext import (
 )
 from supabase import create_client, Client
 
-# Logging configuration
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
-# ------------------------------------------------------------------
-# ENVIRONMENT & HARDCODED CONFIGURATION
-# ------------------------------------------------------------------
+# Environment Variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# Hardcoded Admin Telegram IDs for VIP Alerts
+# Admin IDs
 ADMIN_USER_IDS = [1622298145, 389487101]
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ------------------------------------------------------------------
-# TIER PERMISSIONS DEFINITION
-# ------------------------------------------------------------------
+# Matrix permissions
 TIER_PERMISSIONS = {
     "Meal Plan Only": {"allow_media": False, "allow_qa": False, "priority": False},
-    "Coaching Tier": {"allow_media": True, "allow_qa": True, "priority": False},
-    "Elite Transformation (90 Days)": {"allow_media": True, "allow_qa": True, "priority": True},
+    "Kickstart (21 Days)": {"allow_media": False, "allow_qa": True, "priority": False},
+    "Transformation (60 Days)": {"allow_media": True, "allow_qa": True, "priority": False},
+    "Elite Transformation (90 Days)": {"allow_media": True, "allow_qa": True, "priority": False},
+    "Lifestyle Coaching (6 Months)": {"allow_media": True, "allow_qa": True, "priority": True},
+    "VIP Coaching (6 Months)": {"allow_media": True, "allow_qa": True, "priority": True},
 }
 
 # ------------------------------------------------------------------
-# DUMMY WEB SERVER (Keeps Render Health Checks Active)
+# RENDER DUMMY WEB SERVER
 # ------------------------------------------------------------------
 async def health_check(request):
     return web.Response(text="Server listening on port 8080 & Bot polling started.")
@@ -58,82 +56,164 @@ async def start_web_server():
     await site.start()
 
 # ------------------------------------------------------------------
-# BOT COMMANDS & CALLBACK HANDLERS
+# BOT COMMANDS & CALLBACKS
 # ------------------------------------------------------------------
-async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("🥗 My Meal Plan", callback_data="get_meal_plan")],
-        [InlineKeyboardButton("🏋️ My Workout Plan", callback_data="get_workout_plan")],
-        [InlineKeyboardButton("📊 Log Progress", callback_data="trigger_checkin")],
+        [InlineKeyboardButton("📖 My Target Plan", callback_data="get_target_plan")],
+        [InlineKeyboardButton("📊 Daily Check-In", callback_data="start_checkin")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "Welcome to Simon Origin Portal! 🎯\nSelect an option below to view your plans or log progress:",
+        "Welcome to Simon Origin Tracking & Coaching Portal! 🎯\nSelect an option below to manage your journey:",
         reply_markup=reply_markup,
     )
 
-async def handle_plan_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_target_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    col_name = "meal_plan_url" if query.data == "get_meal_plan" else "workout_plan_url"
-    plan_label = "Meal Plan" if col_name == "meal_plan_url" else "Workout Plan"
 
     try:
-        res = supabase.table("clients").select(col_name).eq("id", user_id).execute()
-        if res.data and res.data[0].get(col_name):
-            url = res.data[0][col_name]
-            await query.message.reply_text(f"🥗 Here is your personalized {plan_label}:\n\n🔗 {url}")
+        res = supabase.table("clients").select("package, meal_plan_url, workout_plan_url, goal").eq("id", user_id).execute()
+        if not res.data:
+            await query.message.reply_text("📋 Profile not found. Please complete onboarding with Bot #1 first!")
+            return
+
+        client = res.data[0]
+        tier = client.get("package", "Meal Plan Only")
+        meal_url = client.get("meal_plan_url", "Not Uploaded Yet")
+        workout_url = client.get("workout_plan_url", "Not Uploaded Yet")
+
+        if tier == "Meal Plan Only":
+            text = f"📋 <b>YOUR NUTRITION BLUEPRINT SUMMARY</b>\n\n🔗 <b>Meal Plan:</b> {meal_url}"
         else:
-            await query.message.reply_text(f"📋 Your {plan_label.lower()} hasn't been uploaded yet. Coach Simon will notify you once it's ready!")
+            text = f"📋 <b>YOUR FULL COACHING BLUEPRINT SUMMARY</b>\n\n🔗 <b>Meal Plan:</b> {meal_url}\n🏋️ <b>Workout Plan:</b> {workout_url}"
+
+        await query.message.reply_text(text, parse_mode="HTML")
     except Exception as e:
-        logging.error(f"Database fetch error: {e}")
-        await query.message.reply_text("⚠️ Could not fetch your plan right now. Please try again later.")
+        logging.error(f"Error fetching target plan: {e}")
+        await query.message.reply_text("⚠️ Database error fetching your plan.")
 
 # ------------------------------------------------------------------
-# TIER-BASED CLIENT INPUT HANDLER
+# DYNAMIC FAT LOSS VS MUSCLE CHECK-IN FLOW
 # ------------------------------------------------------------------
-async def handle_client_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
 
-    # Fetch user tier dynamically from Supabase
+    # Get Client Goal
     try:
-        res = supabase.table("clients").select("package").eq("id", user.id).execute()
-        tier = res.data[0].get("package", "Meal Plan Only") if res.data else "Meal Plan Only"
+        res = supabase.table("clients").select("goal").eq("id", user_id).execute()
+        goal = res.data[0].get("goal", "goal_fat_loss") if res.data else "goal_fat_loss"
+    except Exception:
+        goal = "goal_fat_loss"
+
+    if goal == "goal_muscle":
+        keyboard = [
+            [InlineKeyboardButton("🎯 Hit Protein & Calorie Target", callback_data="log_nut_hit")],
+            [InlineKeyboardButton("⚠️ Under-Ate Protein/Calories", callback_data="log_nut_miss")],
+        ]
+        text = "🔔 <b>DAILY MUSCLE BUILDING CHECK-IN</b>\nDid you hit your daily protein & total calorie targets today?"
+    else:
+        keyboard = [
+            [InlineKeyboardButton("🎯 Hit Deficit Target", callback_data="log_nut_hit")],
+            [InlineKeyboardButton("⚠️ Exceeded Calorie Target", callback_data="log_nut_miss")],
+        ]
+        text = "🔔 <b>DAILY FAT LOSS CHECK-IN</b>\nDid you stay within your prescribed calorie deficit today?"
+
+    await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+
+async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = query.from_user.id
+
+    if data in ["log_nut_hit", "log_nut_miss"]:
+        status = "Hit" if data == "log_nut_hit" else "Missed"
+        context.user_data["checkin_nut"] = status
+
+        # Hydration / Sleep Question
+        res = supabase.table("clients").select("goal").eq("id", user_id).execute()
+        goal = res.data[0].get("goal", "goal_fat_loss") if res.data else "goal_fat_loss"
+
+        if goal == "goal_muscle":
+            keyboard = [
+                [InlineKeyboardButton("💤 Hit Sleep Target (7+ hrs)", callback_data="log_second_hit")],
+                [InlineKeyboardButton("❌ Under-Rested", callback_data="log_second_miss")],
+            ]
+            text = "💧 <b>RECOVERY CHECK</b>\nDid you hit your sleep and recovery target today?"
+        else:
+            keyboard = [
+                [InlineKeyboardButton("💧 Hit Water Target (3.5L)", callback_data="log_second_hit")],
+                [InlineKeyboardButton("❌ Missed Target", callback_data="log_second_miss")],
+            ]
+            text = "💧 <b>HYDRATION CHECK</b>\nDid you hit your 3.5L water target today?"
+
+        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+
+    elif data in ["log_second_hit", "log_second_miss"]:
+        second_status = "Hit" if data == "log_second_hit" else "Missed"
+        nut_status = context.user_data.get("checkin_nut", "Logged")
+
+        # Save Check-in Log
+        try:
+            supabase.table("daily_logs").insert({
+                "client_id": user_id,
+                "nutrition_status": nut_status,
+                "hydration_status": second_status
+            }).execute()
+        except Exception as e:
+            logging.error(f"Failed to record check-in: {e}")
+
+        await query.message.reply_text("🎉 <b>Check-In Completed!</b>\nYour data has been date-locked. Coach Simon will review your progress in your next check-in!", parse_mode="HTML")
+
+# ------------------------------------------------------------------
+# MEDIA & ATTACHMENT HANDLER
+# ------------------------------------------------------------------
+async def handle_client_attachments(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    # Fetch Client Tier and Goal
+    try:
+        res = supabase.table("clients").select("package, goal, full_name").eq("id", user.id).execute()
+        client = res.data[0] if res.data else {}
+        tier = client.get("package", "Meal Plan Only")
+        goal = client.get("goal", "goal_fat_loss")
     except Exception:
         tier = "Meal Plan Only"
+        goal = "goal_fat_loss"
 
     perms = TIER_PERMISSIONS.get(tier, TIER_PERMISSIONS["Meal Plan Only"])
 
-    # Handle Photo, Video, or Voice Attachments
+    # Media attachments (Photos/Videos/Voice)
     if update.message.photo or update.message.video or update.message.voice:
         if not perms["allow_media"]:
             await update.message.reply_text(
-                "Note: Photo/video form reviews and voice note audits are reserved for Coaching Tiers. Tap below to upgrade:",
+                "Note: Video/photo form reviews and voice note audits are reserved for Transformation Tiers. Tap below to upgrade:",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏋️ Upgrade Plan", callback_data="upgrade_tier")]]),
             )
             return
 
-        if update.message.voice and update.message.voice.duration > 120:
-            await update.message.reply_text("Voice notes are capped at 2 minutes max so Coach Simon can review efficiently! Please send a shorter audio note.")
-            return
+        media_type = "photo" if update.message.photo else ("video" if update.message.video else "voice")
+        file_id = update.message.photo[-1].file_id if update.message.photo else (update.message.video.file_id if update.message.video else update.message.voice.file_id)
 
-        # Log entry to Supabase
         try:
-            supabase.table("progress_logs").insert({
+            supabase.table("client_media").insert({
                 "client_id": user.id,
-                "created_at": date_str,
-                "has_media": True,
-                "message_text": update.message.caption or "Media attachment"
+                "media_type": media_type,
+                "telegram_file_id": file_id,
+                "message_text": update.message.caption or ""
             }).execute()
         except Exception as e:
-            logging.error(f"Failed to log media to Supabase: {e}")
+            logging.error(f"Error saving media attachment: {e}")
 
         await update.message.reply_text("Got it! 🎥 Your attachment has been date-locked and saved. Coach Simon will review it in your <b>next check-in</b>.", parse_mode="HTML")
         return
 
-    # Handle Text Notes / Questions
+    # Text Notes / Questions
     if update.message.text:
         if not perms["allow_qa"]:
             await update.message.reply_text(
@@ -142,30 +222,29 @@ async def handle_client_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-        # Save note to Supabase
         try:
-            supabase.table("progress_logs").insert({
+            supabase.table("client_media").insert({
                 "client_id": user.id,
-                "created_at": date_str,
-                "has_media": False,
+                "media_type": "text",
                 "message_text": update.message.text
             }).execute()
         except Exception as e:
-            logging.error(f"Failed to log note to Supabase: {e}")
+            logging.error(f"Error saving text note: {e}")
 
         if perms.get("priority"):
-            vip_alert = f"🚨 <b>INSTANT VIP QUESTION!</b>\nFrom: {user.full_name}\nMessage: {update.message.text}"
+            goal_label = "💪 MUSCLE BUILDING" if goal == "goal_muscle" else "🔥 FAT LOSS"
+            vip_alert = f"🚨 <b>INSTANT VIP QUESTION!</b>\nClient: {user.full_name}\nTier: {tier} ({goal_label})\nMessage: {update.message.text}"
             for admin_id in ADMIN_USER_IDS:
                 try:
                     await context.bot.send_message(chat_id=admin_id, text=vip_alert, parse_mode="HTML")
-                except Exception as e:
-                    logging.error(f"Failed to send VIP alert to {admin_id}: {e}")
-            await update.message.reply_text("Your VIP message has been routed directly to Coach Simon!")
+                except Exception:
+                    pass
+            await update.message.reply_text("Your VIP message has been routed directly to Coach Simon for priority review!")
         else:
             await update.message.reply_text("Question saved! 📝 Coach Simon will address this in your <b>next check-in</b>.", parse_mode="HTML")
 
 # ------------------------------------------------------------------
-# MAIN ENTRY POINT
+# MAIN INITIALIZATION
 # ------------------------------------------------------------------
 async def post_init(application):
     await start_web_server()
@@ -174,10 +253,11 @@ def main():
     persistence = PicklePersistence(filepath="bot_persistence")
     app = ApplicationBuilder().token(BOT_TOKEN).persistence(persistence).post_init(post_init).build()
 
-    app.add_handler(CommandHandler("start", plan_command))
-    app.add_handler(CommandHandler("plan", plan_command))
-    app.add_handler(CallbackQueryHandler(handle_plan_request, pattern="^get_meal_plan$|^get_workout_plan$"))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_client_input))
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CallbackQueryHandler(handle_target_plan, pattern="^get_target_plan$"))
+    app.add_handler(CallbackQueryHandler(trigger_daily_checkin, pattern="^start_checkin$"))
+    app.add_handler(CallbackQueryHandler(handle_checkin_responses, pattern="^log_"))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_client_attachments))
 
     print("⚡ Bot #2 (Simon Tracking & Coaching Portal) is live on Render...")
     app.run_polling()
