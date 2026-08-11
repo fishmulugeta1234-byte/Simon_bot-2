@@ -1,4 +1,4 @@
-python-telegram-bot==21.1.1
-supabase==2.3.4
-aiohttp==3.9.3
-apscheduler==3.10.4
+python-telegram-bot
+supabase
+aiohttp
+apscheduler
