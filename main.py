@@ -221,14 +221,18 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
 
 async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
     try:
-        res = supabase.table("clients").select("id, package, created_at, renewal_notified, testimonial_notified").eq("is_active", True).execute()
+        # FIX: use package_started_at (resets on renewal/upgrade) instead of created_at
+        # (which is the client's original signup date and should stay untouched so
+        # /clientinfo and profile views keep showing true account age)
+        res = supabase.table("clients").select("id, package, created_at, package_started_at, renewal_notified, testimonial_notified").eq("is_active", True).execute()
         if not res.data: return
         now = datetime.now(timezone.utc)
         
         for client in res.data:
             c_id = client["id"]
             pkg = client.get("package", "Meal Plan Only (2 Months)")
-            days_active = (now - parse_supabase_timestamp(client["created_at"])).days
+            cycle_start_raw = client.get("package_started_at") or client["created_at"]
+            days_active = (now - parse_supabase_timestamp(cycle_start_raw)).days
 
             completion_days = (
                 60 if "Meal Plan Only" in pkg else
@@ -298,7 +302,15 @@ async def admin_set_package(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        supabase.table("clients").update({"package": tier_name}).eq("id", target_id).execute()
+        # FIX: reset the cycle clock and notification flags so renewals/upgrades
+        # get their own fresh expiration + testimonial timeline instead of inheriting
+        # the flags from whatever package the client was on before
+        supabase.table("clients").update({
+            "package": tier_name,
+            "package_started_at": datetime.now(timezone.utc).isoformat(),
+            "renewal_notified": False,
+            "testimonial_notified": False,
+        }).eq("id", target_id).execute()
         lang = await get_client_language(int(target_id))
         msg = f"🎉 <b>Package Upgraded!</b>\nYour account has been updated to <b>{tier_name}</b>." if lang == "en" else f"🎉 <b>ፓኬጅዎ ተሻሽሏል! / Package Upgraded!</b>\nመለያዎ ወደ <b>{tier_name}</b> ከፍ ብሏል። እንኳን ደስ አለዎት!"
         await send_message_safely(context, chat_id=int(target_id), text=msg, parse_mode="HTML")
@@ -876,7 +888,14 @@ async def handle_admin_tier_approval(update: Update, context: ContextTypes.DEFAU
     tier = tier_map.get(parts[3] if len(parts) > 3 else "Tra", "Transformation (60 Days)")
 
     try:
-        supabase.table("clients").update({"package": tier}).eq("id", t_id).execute()
+        # FIX: same cycle-reset as /setpackage, applied here since payment approval
+        # is the other path that changes a client's package
+        supabase.table("clients").update({
+            "package": tier,
+            "package_started_at": datetime.now(timezone.utc).isoformat(),
+            "renewal_notified": False,
+            "testimonial_notified": False,
+        }).eq("id", t_id).execute()
         msg = f"🎉 <b>Payment Approved!</b>\nUpgraded to <b>{tier}</b>." if await get_client_language(int(t_id)) == "en" else f"🎉 <b>ክፍያዎ ጸድቋል! / Payment Approved!</b>\nመለያዎ ወደ <b>{tier}</b> ከፍ ብሏል። እንኳን ደስ አለዎት!"
         await send_message_safely(context, chat_id=int(t_id), text=msg, parse_mode="HTML")
         await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ <b>APPROVED BY ሳይመን</b> ({tier})", parse_mode="HTML")
