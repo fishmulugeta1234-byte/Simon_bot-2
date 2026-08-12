@@ -43,13 +43,14 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 EAT_TIMEZONE = ZoneInfo("Africa/Addis_Ababa")
 
 # ------------------------------------------------------------------
-# TIER PERMISSIONS DEFINITION
+# TIER PERMISSIONS DEFINITION (SYNCHRONIZED WITH BOT 1)
 # ------------------------------------------------------------------
 TIER_PERMISSIONS = {
     "Meal Plan Only": {"allow_media": False, "allow_qa": False, "priority": False},
     "Kickstart (21 Days)": {"allow_media": False, "allow_qa": True, "priority": False},
     "Transformation (60 Days)": {"allow_media": True, "allow_qa": True, "priority": False},
-    "Lifestyle Coaching (3 Months)": {"allow_media": True, "allow_qa": True, "priority": True},
+    "Elite Transformation (90 Days)": {"allow_media": True, "allow_qa": True, "priority": True},
+    "Lifestyle Coaching (6 Months)": {"allow_media": True, "allow_qa": True, "priority": True},
     "VIP Coaching (6 Months)": {"allow_media": True, "allow_qa": True, "priority": True},
 }
 
@@ -222,8 +223,13 @@ async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
 
             days_active = (now - parse_supabase_timestamp(client["created_at"])).days
 
-            # 1. Testimonial Prompt on Program Completion (e.g., around Day 21, 60, 90, 180 based on package)
-            completion_days = 21 if "Kickstart" in pkg else (60 if "Transformation" in pkg else (90 if "Lifestyle" in pkg else 180))
+            # Dynamic completion days based on synchronized tiers
+            completion_days = (
+                21 if "Kickstart" in pkg else 
+                (60 if "Transformation" in pkg else 
+                (90 if "Elite" in pkg else 180))
+            )
+            
             if days_active >= completion_days and not client.get("testimonial_notified"):
                 testimonial_text = (
                     "🏆 <b>እንኳን ደስ አለዎት! ሌቭሉን በድል ጨርሰዋል! 🔥</b>\n\n"
@@ -235,7 +241,6 @@ async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
                     supabase.table("clients").update({"testimonial_notified": True}).eq("id", c_id).execute()
                 await asyncio.sleep(0.05)
 
-            # 2. Expiry & Renewal Warning (around Day 57 for 60-day programs, etc.)
             if not client.get("renewal_notified") and days_active >= (completion_days - 3):
                 success = await send_message_safely(
                     context, chat_id=c_id, parse_mode="HTML",
@@ -546,18 +551,20 @@ async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TY
 
     if loc_type == "et":
         keyboard = [
-            [InlineKeyboardButton("⚡ Kickstart (21 Days) — 3,500 ETB", callback_data="upgrade_kickstart")],
-            [InlineKeyboardButton("🔥 Transformation (60 Days) — 7,000 ETB", callback_data="upgrade_transformation")],
-            [InlineKeyboardButton("🌟 Lifestyle (3 Months) — 18,000 ETB", callback_data="upgrade_lifestyle")],
-            [InlineKeyboardButton("👑 VIP Coaching (6 Months) — 30,000 ETB", callback_data="upgrade_vip")],
+            [InlineKeyboardButton("⚡ Kickstart (21 Days) — 4,500 ETB", callback_data="upgrade_kickstart")],
+            [InlineKeyboardButton("🔥 Transformation (60 Days) — 8,900 ETB", callback_data="upgrade_transformation")],
+            [InlineKeyboardButton("🥇 Elite (90 Days) — 12,500 ETB", callback_data="upgrade_elite")],
+            [InlineKeyboardButton("🌟 Lifestyle (6 Months) — 24,000 ETB", callback_data="upgrade_lifestyle")],
+            [InlineKeyboardButton("👑 VIP Coaching (6 Months) — 39,000 ETB", callback_data="upgrade_vip")],
             [InlineKeyboardButton("📲 ከሳይመን ጋር መነጋገር", url="https://t.me/s_simon_19")]
         ]
     else:
         keyboard = [
             [InlineKeyboardButton("⚡ Kickstart (21 Days) — $50", callback_data="upgrade_kickstart")],
-            [InlineKeyboardButton("🔥 Transformation (60 Days) — $99", callback_data="upgrade_transformation")],
-            [InlineKeyboardButton("🌟 Lifestyle (3 Months) — $249", callback_data="upgrade_lifestyle")],
-            [InlineKeyboardButton("👑 VIP Coaching (6 Months) — $499", callback_data="upgrade_vip")],
+            [InlineKeyboardButton("🔥 Transformation (60 Days) — $119", callback_data="upgrade_transformation")],
+            [InlineKeyboardButton("🥇 Elite (90 Days) — $159", callback_data="upgrade_elite")],
+            [InlineKeyboardButton("🌟 Lifestyle (6 Months) — $299", callback_data="upgrade_lifestyle")],
+            [InlineKeyboardButton("👑 VIP Coaching (6 Months) — $549", callback_data="upgrade_vip")],
             [InlineKeyboardButton("📲 Contact Simon", url="https://t.me/s_simon_19")]
         ]
 
@@ -588,7 +595,8 @@ async def handle_upgrade_payment_info(update: Update, context: ContextTypes.DEFA
     tier_map = {
         "upgrade_kickstart": "Kickstart (21 Days)", 
         "upgrade_transformation": "Transformation (60 Days)",
-        "upgrade_lifestyle": "Lifestyle Coaching (3 Months)", 
+        "upgrade_elite": "Elite Transformation (90 Days)",
+        "upgrade_lifestyle": "Lifestyle Coaching (6 Months)", 
         "upgrade_vip": "VIP Coaching (6 Months)"
     }
     sel = tier_map.get(query.data, "Transformation (60 Days)")
@@ -737,7 +745,13 @@ async def handle_admin_tier_approval(update: Update, context: ContextTypes.DEFAU
     parts = query.data.split("_")
     if len(parts) < 3: return
     t_id = parts[2]
-    tier_map = {"Kic": "Kickstart (21 Days)", "Tra": "Transformation (60 Days)", "Lif": "Lifestyle Coaching (3 Months)", "VIP": "VIP Coaching (6 Months)"}
+    tier_map = {
+        "Kic": "Kickstart (21 Days)", 
+        "Tra": "Transformation (60 Days)", 
+        "Eli": "Elite Transformation (90 Days)", 
+        "Lif": "Lifestyle Coaching (6 Months)", 
+        "VIP": "VIP Coaching (6 Months)"
+    }
     tier = tier_map.get(parts[3] if len(parts) > 3 else "Tra", "Transformation (60 Days)")
 
     try:
