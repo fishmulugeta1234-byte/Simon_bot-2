@@ -600,31 +600,40 @@ async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["awaiting_payment_screenshot"] = False
 
     loc_type = "et"
+    current_package = None
     try:
-        res = supabase.table("clients").select("location_type").eq("id", u_id).execute()
+        res = supabase.table("clients").select("location_type, package").eq("id", u_id).execute()
         if res.data and len(res.data) > 0:
             loc_type = res.data[0].get("location_type", "et")
+            current_package = res.data[0].get("package")
     except Exception as e:
         logging.error(f"Error checking location_type for upgrade {u_id}: {e}")
 
-    if loc_type == "et":
-        keyboard = [
-            [InlineKeyboardButton("⚡ Kickstart (21 Days) — 4,500 ETB", callback_data="upgrade_kickstart")],
-            [InlineKeyboardButton("🔥 Transformation (60 Days) — 8,900 ETB", callback_data="upgrade_transformation")],
-            [InlineKeyboardButton("🥇 Elite (90 Days) — 12,500 ETB", callback_data="upgrade_elite")],
-            [InlineKeyboardButton("🌟 Lifestyle (6 Months) — 24,000 ETB", callback_data="upgrade_lifestyle")],
-            [InlineKeyboardButton("👑 VIP Coaching (6 Months) — 39,000 ETB", callback_data="upgrade_vip")],
-            [InlineKeyboardButton("📲 ከሳይመን ጋር መነጋገር", url="https://t.me/s_simon_19")]
-        ]
-    else:
-        keyboard = [
-            [InlineKeyboardButton("⚡ Kickstart (21 Days) — $50", callback_data="upgrade_kickstart")],
-            [InlineKeyboardButton("🔥 Transformation (60 Days) — $119", callback_data="upgrade_transformation")],
-            [InlineKeyboardButton("🥇 Elite (90 Days) — $159", callback_data="upgrade_elite")],
-            [InlineKeyboardButton("🌟 Lifestyle (6 Months) — $299", callback_data="upgrade_lifestyle")],
-            [InlineKeyboardButton("👑 VIP Coaching (6 Months) — $549", callback_data="upgrade_vip")],
-            [InlineKeyboardButton("📲 Contact Simon", url="https://t.me/s_simon_19")]
-        ]
+    # FIX: full tier name for each row, used to skip whichever one the client is already on
+    # (kept in sync with the callback->tier mapping in handle_upgrade_payment_info)
+    tier_rows_et = [
+        ("Kickstart (21 Days)", "⚡ Kickstart (21 Days) — 4,500 ETB", "upgrade_kickstart"),
+        ("Transformation (60 Days)", "🔥 Transformation (60 Days) — 8,900 ETB", "upgrade_transformation"),
+        ("Elite Transformation (90 Days)", "🥇 Elite (90 Days) — 12,500 ETB", "upgrade_elite"),
+        ("Lifestyle Coaching (6 Months)", "🌟 Lifestyle (6 Months) — 24,000 ETB", "upgrade_lifestyle"),
+        ("VIP Coaching (6 Months)", "👑 VIP Coaching (6 Months) — 39,000 ETB", "upgrade_vip"),
+    ]
+    tier_rows_intl = [
+        ("Kickstart (21 Days)", "⚡ Kickstart (21 Days) — $50", "upgrade_kickstart"),
+        ("Transformation (60 Days)", "🔥 Transformation (60 Days) — $119", "upgrade_transformation"),
+        ("Elite Transformation (90 Days)", "🥇 Elite (90 Days) — $159", "upgrade_elite"),
+        ("Lifestyle Coaching (6 Months)", "🌟 Lifestyle (6 Months) — $299", "upgrade_lifestyle"),
+        ("VIP Coaching (6 Months)", "👑 VIP Coaching (6 Months) — $549", "upgrade_vip"),
+    ]
+
+    rows = tier_rows_et if loc_type == "et" else tier_rows_intl
+    keyboard = [
+        [InlineKeyboardButton(label, callback_data=cb)]
+        for (tier_name, label, cb) in rows
+        if tier_name != current_package
+    ]
+    contact_label = "📲 ከሳይመን ጋር መነጋገር" if loc_type == "et" else "📲 Contact Simon"
+    keyboard.append([InlineKeyboardButton(contact_label, url="https://t.me/s_simon_19")])
 
     try:
         await query.message.reply_text(
