@@ -306,7 +306,6 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     col = "meal_plan_url" if p_type == "meal" else "workout_plan_url"
     
     try:
-        # Automatically set plan_ready to True when you upload a plan!
         supabase.table("clients").update({col: update.message.document.file_id, "plan_ready": True}).eq("id", c_id).execute()
         await send_message_safely(
             context, chat_id=c_id, parse_mode="HTML",
@@ -405,7 +404,6 @@ async def get_main_menu_markup(user_id: int):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
-    # 🛡️ GATEKEEPER CHECK: See if plan_ready is True or False in Supabase
     try:
         res = supabase.table("clients").select("plan_ready, language").eq("id", user_id).execute()
         if res.data and len(res.data) > 0:
@@ -420,7 +418,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         plan_is_ready = False
         lang = "am"
 
-    # If plan is NOT ready yet, show the waiting screen
     if not plan_is_ready:
         if lang == "am":
             wait_text = (
@@ -443,7 +440,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(wait_text, reply_markup=support_markup, parse_mode="HTML")
         return
 
-    # If plan IS ready, open the full portal normally!
     markup = await get_main_menu_markup(user_id)
     await update.message.reply_text(
         "እንኳን ወደ ሲሞን ኦሪጅን የክትትል እና ኮቺንግ ፖርታል በደህና መጡ! 🎯\n"
@@ -513,18 +509,38 @@ async def handle_target_plan(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.message.reply_text("⚠️ Error fetching plans.")
 
 # ------------------------------------------------------------------
-# UPGRADE & PAYMENT FLOW
+# UPGRADE & PAYMENT FLOW (UPDATED WITH NEW USD PRICES & LOCAL ETB)
 # ------------------------------------------------------------------
 async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    keyboard = [
-        [InlineKeyboardButton("⚡ Kickstart (21 Days) — 3,500 ETB", callback_data="upgrade_kickstart")],
-        [InlineKeyboardButton("🔥 Transformation (60 Days) — 7,000 ETB", callback_data="upgrade_transformation")],
-        [InlineKeyboardButton("🌟 Lifestyle (3 Months) — 9,000 ETB", callback_data="upgrade_lifestyle")],
-        [InlineKeyboardButton("👑 VIP Coaching (6 Months) — 30,000 ETB", callback_data="upgrade_vip")],
-        [InlineKeyboardButton("📲 ከሳይመን ጋር መነጋገር", url="https://t.me/s_simon_19")]
-    ]
+    u_id = query.from_user.id
+    
+    loc_type = "et"
+    try:
+        res = supabase.table("clients").select("location_type").eq("id", u_id).execute()
+        if res.data and len(res.data) > 0:
+            loc_type = res.data[0].get("location_type", "et")
+    except Exception:
+        pass
+
+    if loc_type == "et":
+        keyboard = [
+            [InlineKeyboardButton("⚡ Kickstart (21 Days) — 3,500 ETB", callback_data="upgrade_kickstart")],
+            [InlineKeyboardButton("🔥 Transformation (60 Days) — 7,000 ETB", callback_data="upgrade_transformation")],
+            [InlineKeyboardButton("🌟 Lifestyle (3 Months) — 18,000 ETB", callback_data="upgrade_lifestyle")],
+            [InlineKeyboardButton("👑 VIP Coaching (6 Months) — 30,000 ETB", callback_data="upgrade_vip")],
+            [InlineKeyboardButton("📲 ከሳይመን ጋር መነጋገር", url="https://t.me/s_simon_19")]
+        ]
+    else:
+        keyboard = [
+            [InlineKeyboardButton("⚡ Kickstart (21 Days) — $50", callback_data="upgrade_kickstart")],
+            [InlineKeyboardButton("🔥 Transformation (60 Days) — $99", callback_data="upgrade_transformation")],
+            [InlineKeyboardButton("🌟 Lifestyle (3 Months) — $249", callback_data="upgrade_lifestyle")],
+            [InlineKeyboardButton("👑 VIP Coaching (6 Months) — $499", callback_data="upgrade_vip")],
+            [InlineKeyboardButton("📲 Contact Simon", url="https://t.me/s_simon_19")]
+        ]
+
     await query.message.reply_text(
         "🏋️ <b>ፓኬጅ ማሻሻያ / UPGRADE TO FULL COACHING</b>\n\n"
         "ሙሉ የ 1-ለ-1 ክትትል፣ የፎርም ግምገማ፣ የድምጽ ኦዲት እና የተስተካከሉ እቅዶችን ያግኙ!\n"
@@ -536,15 +552,41 @@ async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_upgrade_payment_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    u_id = query.from_user.id
+
+    loc_type = "et"
+    try:
+        res = supabase.table("clients").select("location_type").eq("id", u_id).execute()
+        if res.data and len(res.data) > 0:
+            loc_type = res.data[0].get("location_type", "et")
+    except Exception:
+        pass
+
     tier_map = {
-        "upgrade_kickstart": "Kickstart (21 Days)", "upgrade_transformation": "Transformation (60 Days)",
-        "upgrade_lifestyle": "Lifestyle Coaching (3 Months)", "upgrade_vip": "VIP Coaching (6 Months)"
+        "upgrade_kickstart": "Kickstart (21 Days)", 
+        "upgrade_transformation": "Transformation (60 Days)",
+        "upgrade_lifestyle": "Lifestyle Coaching (3 Months)", 
+        "upgrade_vip": "VIP Coaching (6 Months)"
     }
     sel = tier_map.get(query.data, "Transformation (60 Days)")
     context.user_data["pending_tier"] = sel
-    text = (f"💳 <b>ክፍያ መፈጸሚያ / UPGRADE TO {sel.upper()}</b>\n\nክፍያውን ከዚህ በታች ባሉት አካውንቶች ያስተላልፉ:\nTransfer fee via:\n"
-            f"• <b>ሲቢኢ (CBE):</b> 1000357796532 (Simon Mulugeta)\n• <b>ቴሌብር (Telebirr):</b> 0939998090 (Simon Mulugeta)\n\n"
-            f"📸 <b>ቀጣይ እርምጃ / Next Step:</b> የክፍያ ማረጋገጫ (Receipt) ስክሪንሾትዎን ወደዚህ ቻት ይላኩ!\nSend your payment receipt screenshot to this chat!")
+
+    if loc_type == "et":
+        text = (
+            f"💳 <b>ክፍያ መፈጸሚያ / UPGRADE TO {sel.upper()}</b>\n\n"
+            f"ክፍያውን ከዚህ በታች ባሉት አካውንቶች ያስተላልፉ:\n"
+            f"• <b>ሲቢኢ (CBE):</b> 1000357796532 (Simon Mulugeta)\n"
+            f"• <b>ቴሌብር (Telebirr):</b> 0939998090 (Simon Mulugeta)\n\n"
+            f"📸 <b>ቀጣይ እርምጃ / Next Step:</b> የክፍያ ማረጋገጫ (Receipt) ስክሪንሾትዎን ወደዚህ ቻት ይላኩ!"
+        )
+    else:
+        text = (
+            f"💳 <b>Payment Instructions / UPGRADE TO {sel.upper()}</b>\n\n"
+            f"Since you are joining from abroad, please contact Simon directly or use your international payment option (Grey account) to complete your checkout.\n\n"
+            f"📲 <b>Contact Simon to pay:</b> https://t.me/s_simon_19\n\n"
+            f"📸 Once completed, send your payment confirmation receipt screenshot to this chat!"
+        )
+
     await query.message.reply_text(text, parse_mode="HTML")
 
 # ------------------------------------------------------------------
@@ -717,4 +759,4 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-main()
+    main()
