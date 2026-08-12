@@ -249,8 +249,41 @@ async def send_daily_checkin_reminders(context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error sending daily check-in reminders: {e}")
 
 # ------------------------------------------------------------------
-# ADMIN COMMANDS (Set Package, Client Info, Plans & Delivery)
+# ADMIN COMMANDS (Broadcast, Set Package, Client Info, Plans & Delivery)
 # ------------------------------------------------------------------
+async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Broadcasts a message to all active clients safely with rate limiting."""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        return
+
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: `/broadcast <your announcement message>`", parse_mode="HTML")
+        return
+
+    broadcast_text = "📢 <b>ANNOUNCEMENT FROM COACH SIMON / ማስታወቂያ</b>\n\n" + " ".join(context.args)
+
+    try:
+        res = supabase.table("clients").select("id").eq("is_active", True).execute()
+        if not res.data:
+            await update.message.reply_text("❌ No active clients found to broadcast to.")
+            return
+
+        client_ids = [c["id"] for c in res.data]
+        success_count = 0
+
+        status_msg = await update.message.reply_text(f"🚀 Broadcasting to {len(client_ids)} clients...")
+
+        for c_id in client_ids:
+            delivered = await send_message_safely(context, chat_id=c_id, text=broadcast_text, parse_mode="HTML")
+            if delivered:
+                success_count += 1
+            await asyncio.sleep(0.05)  # Rate limiting safety delay
+
+        await status_msg.edit_text(f"✅ Broadcast complete! Successfully delivered to {success_count} / {len(client_ids)} active clients.")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Broadcast failed: {e}")
+
 async def admin_set_package(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Instantly updates a client's coaching package right from Telegram."""
     user_id = update.effective_user.id
@@ -280,7 +313,6 @@ async def admin_set_package(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         supabase.table("clients").update({"package": tier_name}).eq("id", target_id).execute()
         
-        # Notify client of their upgraded tier
         lang = await get_client_language(int(target_id))
         if lang == "en":
             client_msg = f"🎉 <b>Package Upgraded!</b>\nYour account has been updated to <b>{tier_name}</b>. Enjoy your new features!"
@@ -426,19 +458,21 @@ async def admin_send_voice_feedback(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text(f"⚠️ Failed to deliver voice note: {e}")
 
 # ------------------------------------------------------------------
-# BOT COMMANDS, MAIN MENU & LANGUAGE TOGGLE
+# BOT COMMANDS, MAIN MENU & CLIENT PROFILE VIEW
 # ------------------------------------------------------------------
 async def get_main_menu_markup(user_id: int):
     lang = await get_client_language(user_id)
     if lang == "en":
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("📖 My Target Plan", callback_data="get_target_plan")],
+            [InlineKeyboardButton("👤 My Profile & Status", callback_data="get_client_profile")],
             [InlineKeyboardButton("📊 Daily Check-In", callback_data="start_checkin")],
             [InlineKeyboardButton("🌐 Switch to Amharic (አማርኛ)", callback_data="set_lang_am")]
         ])
     else:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("📖 የእኔ እቅድ / My Target Plan", callback_data="get_target_plan")],
+            [InlineKeyboardButton("👤 መለያዬ / My Profile", callback_data="get_client_profile")],
             [InlineKeyboardButton("📊 የዕለት ክትትል / Daily Check-In", callback_data="start_checkin")],
             [InlineKeyboardButton("🌐 ወደ እንግሊዝኛ ቀይር (Switch to English)", callback_data="set_lang_en")]
         ])
@@ -472,6 +506,58 @@ async def handle_language_switch(update: Update, context: ContextTypes.DEFAULT_T
         reply_markup=reply_markup,
         parse_mode="HTML"
     )
+
+async def handle_client_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allows clients to view their own membership status and stats."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    lang = await get_client_language(user_id)
+
+    try:
+        res = supabase.table("clients").select("*").eq("id", user_id).execute()
+        if not res.data:
+            msg = "📋 Profile not found. Please complete onboarding first!" if lang == "en" else "📋 መረጃዎ አልተገኘም። እባክዎ መጀመሪያ ይመዝገቡ!"
+            await query.message.reply_text(msg)
+            return
+
+        c = res.data[0]
+        created_dt = parse_supabase_timestamp(c["created_at"])
+        days_active = (datetime.now(timezone.utc) - created_dt).days
+
+        seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        logs_res = (
+            supabase.table("daily_logs")
+            .select("created_at")
+            .eq("client_id", user_id)
+            .gte("created_at", seven_days_ago)
+            .execute()
+        )
+        checkin_count = len(logs_res.data) if logs_res.data else 0
+
+        if lang == "en":
+            profile_text = (
+                f"👤 <b>YOUR COACHING PROFILE</b>\n\n"
+                f"• <b>Name:</b> {c.get('full_name', 'Client')}\n"
+                f"• <b>Package Tier:</b> {c.get('package', 'Meal Plan Only')}\n"
+                f"• <b>Primary Goal:</b> {c.get('goal', 'N/A')}\n"
+                f"• <b>Days Active:</b> {days_active} Days\n"
+                f"• <b>7-Day Check-in Adherence:</b> {checkin_count} / 7 Days\n"
+            )
+        else:
+            profile_text = (
+                f"👤 <b>የኮቺንግ መለያዎ / YOUR PROFILE</b>\n\n"
+                f"• <b>ስም:</b> {c.get('full_name', 'Client')}\n"
+                f"• <b>የፓኬጅ ዓይነት:</b> {c.get('package', 'Meal Plan Only')}\n"
+                f"• <b>ዋና ግብ:</b> {c.get('goal', 'N/A')}\n"
+                f"• <b>የቆይታ ጊዜ:</b> {days_active} ቀናት\n"
+                f"• <b>የ7 ቀን ክትትል:</b> {checkin_count} / 7 ቀናት\n"
+            )
+
+        await query.message.reply_text(profile_text, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Error fetching client profile: {e}")
+        await query.message.reply_text("⚠️ Error loading your profile data.")
 
 async def handle_target_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -545,7 +631,8 @@ async def handle_upgrade_payment_info(update: Update, context: ContextTypes.DEFA
     query = update.callback_query
     await query.answer()
 
-    selected_tier = "60 Days Transformation" if query.data == "upgrade_60day" else "90 Days Elite Transformation"
+    selected_tier = "Transformation (60 Days)" if query.data == "upgrade_60day" else "Elite Transformation (90 Days)"
+    context.user_data["pending_tier"] = selected_tier
 
     text = (
         f"💳 <b>UPGRADE TO {selected_tier.upper()}</b>\n\n"
@@ -565,7 +652,6 @@ async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = query.from_user.id
 
     try:
-        # Guard: Check if already checked in today
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         existing_today = (
             supabase.table("daily_logs")
@@ -682,7 +768,7 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
             context.user_data.pop("checkin_nut", None)
 
 # ------------------------------------------------------------------
-# CRASH-PROOF MEDIA & TEXT HANDLER
+# CRASH-PROOF MEDIA & PAYMENT VERIFICATION HANDLER
 # ------------------------------------------------------------------
 async def handle_client_attachments(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -694,15 +780,13 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
             res = supabase.table("clients").select("package, goal, full_name").eq("id", user.id).execute()
             client = res.data[0] if res.data and len(res.data) > 0 else {}
             tier = client.get("package", "Meal Plan Only")
-            goal = client.get("goal", "goal_fat_loss")
         except Exception:
             tier = "Meal Plan Only"
-            goal = "goal_fat_loss"
 
         perms = TIER_PERMISSIONS.get(tier, TIER_PERMISSIONS["Meal Plan Only"])
 
         if update.message.photo or update.message.video or update.message.voice:
-            if not perms["allow_media"]:
+            if not perms["allow_media"] and not update.message.photo:
                 await update.message.reply_text(
                     "Note: Form reviews and voice notes are reserved for Transformation Tiers. Tap below to upgrade:",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏋️ Upgrade Plan", callback_data="upgrade_tier")]]),
@@ -724,10 +808,23 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
 
             await update.message.reply_text("Got it! 🎥 Your attachment has been saved for Coach Simon's review.", parse_mode="HTML")
 
-            if update.message.photo and tier == "Meal Plan Only":
-                 vip_alert = f"🚨 <b>UPGRADE RECEIPT / የክፍያ ደረሰኝ!</b>\nClient: {user.full_name} ({user.id})"
-                 for admin_id in ADMIN_USER_IDS:
-                     await send_message_safely(context, chat_id=admin_id, photo=file_id, caption=vip_alert, parse_mode="HTML")
+            # If it's a photo, alert admins with an interactive approval button for payment receipts
+            if update.message.photo:
+                # Default to 60 Days Transformation if pending tier isn't found
+                target_tier = context.user_data.get("pending_tier", "Transformation (60 Days)")
+                vip_alert = (
+                    f"🚨 <b>PAYMENT RECEIPT / የክፍያ ደረሰኝ!</b>\n"
+                    f"• <b>Client:</b> {user.full_name} (<code>{user.id}</code>)\n"
+                    f"• <b>Requested Tier:</b> {target_tier}"
+                )
+                approval_keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"✅ Approve & Set {target_tier}", callback_data=f"approve_tier_{user.id}_{target_tier[:3]}")]
+                ])
+                for admin_id in ADMIN_USER_IDS:
+                    try:
+                        await context.bot.send_photo(chat_id=admin_id, photo=file_id, caption=vip_alert, reply_markup=approval_keyboard, parse_mode="HTML")
+                    except Exception as send_err:
+                        logging.error(f"Failed to send receipt alert to admin {admin_id}: {send_err}")
             return
 
         if update.message.text:
@@ -765,6 +862,43 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
             reply_markup=reply_markup
         )
 
+async def handle_admin_tier_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles admin clicking the instant 'Approve & Activate' button from a receipt photo."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if user_id not in ADMIN_USER_IDS:
+        return
+
+    data = query.data  # e.g., approve_tier_1234567_Tra
+    parts = data.split("_")
+    if len(parts) < 4:
+        return
+
+    target_client_id = parts[2]
+    tier_prefix = parts[3]
+
+    # Map abbreviation back to full tier name
+    tier_map = {
+        "Tra": "Transformation (60 Days)",
+        "Eli": "Elite Transformation (90 Days)"
+    }
+    tier_name = tier_map.get(tier_prefix, "Transformation (60 Days)")
+
+    try:
+        supabase.table("clients").update({"package": tier_name}).eq("id", target_client_id).execute()
+        
+        lang = await get_client_language(int(target_client_id))
+        if lang == "en":
+            client_msg = f"🎉 <b>Payment Approved & Package Activated!</b>\nYour account has been upgraded to <b>{tier_name}</b>. Welcome aboard!"
+        else:
+            client_msg = f"🎉 <b>ክፍያዎ ጸድቋል! / Payment Approved!</b>\nመለያዎ ወደ <b>{tier_name}</b> ከፍ ብሏል። እንኳን ደስ አለዎት!"
+
+        await send_message_safely(context, chat_id=int(target_client_id), text=client_msg, parse_mode="HTML")
+        await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ <b>APPROVED BY COACH</b> ({tier_name})", parse_mode="HTML")
+    except Exception as e:
+        await query.message.reply_text(f"⚠️ Failed to approve tier: {e}")
+
 # ------------------------------------------------------------------
 # MAIN INITIALIZATION & APSCHEDULER WIRING
 # ------------------------------------------------------------------
@@ -774,7 +908,6 @@ async def post_init(application):
     scheduler = AsyncIOScheduler()
     scheduler.add_job(send_sunday_admin_report, "cron", day_of_week="sun", hour=8, minute=0, args=[application])
     scheduler.add_job(check_expirations_and_streaks, "cron", hour=9, minute=0, args=[application])
-    # Friendly daily reminder job scheduled at 8:00 PM EAT every day
     scheduler.add_job(send_daily_checkin_reminders, "cron", hour=20, minute=0, timezone=EAT_TIMEZONE, args=[application])
     scheduler.start()
 
@@ -786,6 +919,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
 
     # Admin Commands
+    app.add_handler(CommandHandler("broadcast", admin_broadcast))
     app.add_handler(CommandHandler("setpackage", admin_set_package))
     app.add_handler(CommandHandler("clientinfo", admin_client_info))
     app.add_handler(CommandHandler("sendplan", admin_send_plan))
@@ -794,20 +928,22 @@ def main():
 
     # Button Callbacks
     app.add_handler(CallbackQueryHandler(handle_target_plan, pattern="^get_target_plan$"))
+    app.add_handler(CallbackQueryHandler(handle_client_profile, pattern="^get_client_profile$"))
     app.add_handler(CallbackQueryHandler(trigger_daily_checkin, pattern="^start_checkin$"))
     app.add_handler(CallbackQueryHandler(handle_checkin_responses, pattern="^log_"))
 
     # Language Switch Callbacks
     app.add_handler(CallbackQueryHandler(handle_language_switch, pattern="^set_lang_"))
 
-    # Upgrade Callbacks
+    # Upgrade & Approval Callbacks
     app.add_handler(CallbackQueryHandler(handle_upgrade_button, pattern="^upgrade_tier$"))
     app.add_handler(CallbackQueryHandler(handle_upgrade_payment_info, pattern="^upgrade_60day$|^upgrade_90day$"))
+    app.add_handler(CallbackQueryHandler(handle_admin_tier_approval, pattern="^approve_tier_"))
 
     # Media & Text Handlers
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_client_attachments))
 
-    print("⚡ Bot #2 is live with /setpackage, same-day guard, and friendly check-in reminders...")
+    print("⚡ Bot #2 is live with /broadcast, client profiles, and instant receipt approvals...")
     app.run_polling()
 
 if __name__ == "__main__":
