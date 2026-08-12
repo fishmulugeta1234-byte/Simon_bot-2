@@ -423,16 +423,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             wait_text = (
                 "⏳ <b>ዕቅድዎ በመዘጋጀት ላይ ይገኛል!</b>\n\n"
                 "📋 ሰላም! መረጃዎ እና ክፍያዎ ተረጋግጦ ወደ ሲስተሙ ገብቷል። ሳይመን አሁን ለእርስዎ የሚስማማውን ልዩ እቅድ በጥንቃቄ በማዘጋጀት ላይ ይገኛል!\n\n"
-                "🍽️ <b>አንድ ትንሽ ጥያቄ:</b> ዕቅድዎ ከእርስዎ የዕለት ተዕለት ሕይወት እና ከምርጫዎችዎ ጋር እንዲጣጣም፣ <b>ብዙውን ጊዜ ምን ዓይነት ምግቦችን ይመገባሉ?</b>\n\n"
-                "👉 <b>እባክዎ አሁን በጽሑፍ ወይም በድምጽ መልእክት (Voice Note) ልኩልኝ!</b>\n\n"
+                "🍽️ <b>አንድ ትንሽ ጥያቄ (ስምዎን በመጥቀስ):</b> ዕቅድዎ ከእርስዎ የዕለት ተዕለት ሕይወት እና ከምርጫዎችዎ ጋር እንዲጣጣም፣ <b>ብዙውን ጊዜ ምን ዓይነት ምግቦችን ይመገባሉ?</b>\n\n"
+                "👉 <b>እባክዎ ስምዎን በመጥቀስ አሁን በጽሑፍ ወይም በድምጽ መልእክት (Voice Note) ልኩልኝ!</b>\n\n"
                 "⏰ ዕቅድዎ ሲጠናቀቅ እና ወደ ቦቱ ሲጫን በቀጥታ ማሳወቂያ ይደርስዎታል!"
             )
         else:
             wait_text = (
                 "⏳ <b>Your Plan is Under Construction!</b>\n\n"
                 "📋 Hello! Your intake and payment are confirmed. Simon is currently building your customized workout and nutrition plan with care.\n\n"
-                "🛒 <b>Quick question:</b> To tailor your nutrition plan to your routine and food preferences, <b>what do your typical meals look like?</b>\n\n"
-                "👉 <b>Please drop me a quick text or voice note right here!</b>\n\n"
+                "🛒 <b>Quick question (Please state your name):</b> To tailor your nutrition plan to your routine and food preferences, <b>what do your typical meals look like?</b>\n\n"
+                "👉 <b>Please mention your name and drop me a quick text or voice note right here!</b>\n\n"
                 "⏰ You will receive an instant notification here the moment your plan is finalized and uploaded!"
             )
         
