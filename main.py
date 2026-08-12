@@ -325,6 +325,61 @@ async def admin_send_voice_feedback(update: Update, context: ContextTypes.DEFAUL
     except Exception as e:
         await update.message.reply_text(f"⚠️ Failed: {e}")
 
+async def admin_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_USER_IDS: 
+        return
+    
+    try:
+        res = supabase.table("clients").select("full_name, package, is_active, plan_ready").execute()
+        clients = res.data or []
+        
+        total = len(clients)
+        active = sum(1 for c in clients if c.get("is_active"))
+        ready_plans = sum(1 for c in clients if c.get("plan_ready"))
+        
+        text = (
+            f"📊 <b>SYSTEM STATUS OVERVIEW</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• 👥 Total Clients: <b>{total}</b>\n"
+            f"• 🟢 Active Users: <b>{active}</b>\n"
+            f"• ✅ Plans Ready: <b>{ready_plans}</b>\n\n"
+            f"<b>Last 5 Registrations:</b>\n"
+        )
+        
+        for client in clients[-5:]:
+            name = client.get("full_name", "Unknown")
+            pkg = client.get("package", "Standard")
+            status = "🟢" if client.get("is_active") else "🔴"
+            text += f"• {status} {name} | <i>{pkg}</i>\n"
+            
+        await update.message.reply_text(text, parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Failed to fetch status: {e}")
+
+async def admin_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_USER_IDS: 
+        return
+    
+    if not context.args or not update.message.document:
+        await update.message.reply_text("⚠️ Usage: Attach a document and type `/sendfile <client_id>`", parse_mode="HTML")
+        return
+
+    c_id = context.args[0]
+    file_id = update.message.document.file_id
+    caption = update.message.caption or "📁 <b>ከሳይመን የተላከ ተጨማሪ ሰነድ / Additional Document from Coach</b>"
+    
+    success = await send_message_safely(
+        context, chat_id=int(c_id), 
+        document=file_id, 
+        caption=caption, 
+        parse_mode="HTML"
+    )
+    
+    if success:
+        await update.message.reply_text(f"✅ Document successfully delivered to client `{c_id}`!", parse_mode="HTML")
+    else:
+        await update.message.reply_text(f"❌ Failed to send document. Check if the client ID is correct or if they blocked the bot.")
+
 # ------------------------------------------------------------------
 # CLIENT COMMANDS & VIEWS (WITH GATEKEEPER CHECK)
 # ------------------------------------------------------------------
@@ -643,6 +698,8 @@ def main():
     app.add_handler(CommandHandler("clientinfo", admin_client_info))
     app.add_handler(CommandHandler("sendplan", admin_send_plan))
     app.add_handler(CommandHandler("reply", admin_send_voice_feedback))
+    app.add_handler(CommandHandler("status", admin_status_command))
+    app.add_handler(CommandHandler("sendfile", admin_send_file))
 
     app.add_handler(CallbackQueryHandler(handle_target_plan, pattern="^get_target_plan$"))
     app.add_handler(CallbackQueryHandler(handle_client_profile, pattern="^get_client_profile$"))
@@ -660,4 +717,4 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-    main()
+main()
