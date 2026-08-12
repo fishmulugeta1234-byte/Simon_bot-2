@@ -118,11 +118,10 @@ async def send_message_safely(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
         return False
 
 # ------------------------------------------------------------------
-# ELITE BACKGROUND JOBS (Sunday Reports, Streaks, Expirations)
+# ELITE BACKGROUND JOBS (Sunday Reports, Streaks, Expirations, Reminders)
 # ------------------------------------------------------------------
 async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
     try:
-        # Filter for active clients
         res = supabase.table("clients").select("id, full_name, package, goal").eq("is_active", True).execute()
         if not res.data:
             return
@@ -131,7 +130,6 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
         if not clients:
             return
 
-        # Fetch all relevant logs in one query
         seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
         client_ids = [c["id"] for c in clients]
         logs_res = (
@@ -161,14 +159,13 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
         full_report = "\n".join(report_lines)
         for admin_id in ADMIN_USER_IDS:
             await send_message_safely(context, chat_id=admin_id, text=full_report, parse_mode="HTML")
-            await asyncio.sleep(0.05)  # Rate limiting safety delay
+            await asyncio.sleep(0.05)
             
     except Exception as e:
         logging.error(f"Error generating Sunday report: {e}")
 
 async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
     try:
-        # Filter for active clients
         res = supabase.table("clients").select("id, full_name, package, created_at, renewal_notified").eq("is_active", True).execute()
         if not res.data:
             return
@@ -201,13 +198,13 @@ async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
                     except Exception as db_err:
                         logging.error(f"Could not set renewal_notified for client {c_id}: {db_err}")
                         
-                await asyncio.sleep(0.05) # Rate limiting safety delay
+                await asyncio.sleep(0.05)
 
     except Exception as e:
         logging.error(f"Error checking expirations: {e}")
 
 async def send_daily_checkin_reminders(context: ContextTypes.DEFAULT_TYPE):
-    """Nudges active clients (who haven't checked in today) to log progress."""
+    """Sends a friendly, high-energy evening nudge to clients who haven't checked in yet."""
     try:
         res = supabase.table("clients").select("id, package, language").eq("is_active", True).execute()
         if not res.data:
@@ -235,25 +232,66 @@ async def send_daily_checkin_reminders(context: ContextTypes.DEFAULT_TYPE):
 
             lang = client.get("language", "am")
             if lang == "en":
-                text = "🔔 <b>Don't forget your daily check-in!</b>\nTap below to log today's progress:"
+                text = "🔥 <b>Evening Check-In Time!</b>\nDon't let your streak break today! Tap below to log your daily progress and keep the momentum rolling:"
             else:
-                text = "🔔 <b>የዕለት ክትትልዎን አይርሱ! / Don't forget your daily check-in!</b>\nዛሬ ያደረጉትን ለመመዝገብ ከታች ይጫኑ:"
+                text = "🔥 <b>የዕለት ክትትል ሰዓት ደርሷል! / Evening Check-In Time!</b>\nStreak እንዳይቋረጥ ዛሬ ያደረጉትን በመመዝገብቀጠሉን ያጠናክሩ! ከታች ይጫኑ:"
 
             await send_message_safely(
                 context,
                 chat_id=c_id,
                 text=text,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Check In Now", callback_data="start_checkin")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Check In Now / አሁኑኑ ይመዝገቡ", callback_data="start_checkin")]]),
                 parse_mode="HTML"
             )
-            await asyncio.sleep(0.05) # Rate limiting safety delay
+            await asyncio.sleep(0.05)
 
     except Exception as e:
         logging.error(f"Error sending daily check-in reminders: {e}")
 
 # ------------------------------------------------------------------
-# ADMIN COMMANDS (Deliverables & Info)
+# ADMIN COMMANDS (Set Package, Client Info, Plans & Delivery)
 # ------------------------------------------------------------------
+async def admin_set_package(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Instantly updates a client's coaching package right from Telegram."""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        return
+
+    if len(context.args) < 2:
+        tiers_list = "\n".join([f"• `{t}`" for t in TIER_PERMISSIONS.keys()])
+        await update.message.reply_text(
+            "⚠️ <b>Usage:</b> `/setpackage <client_id> <tier_name>`\n\n"
+            f"<b>Valid Tiers:</b>\n{tiers_list}",
+            parse_mode="HTML"
+        )
+        return
+
+    target_id = context.args[0]
+    tier_name = " ".join(context.args[1:])
+
+    if tier_name not in TIER_PERMISSIONS:
+        await update.message.reply_text(
+            f"❌ <b>Invalid Tier Name!</b>\nCheck spelling against valid options:\n" +
+            "\n".join([f"• <code>{t}</code>" for t in TIER_PERMISSIONS.keys()]),
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        supabase.table("clients").update({"package": tier_name}).eq("id", target_id).execute()
+        
+        # Notify client of their upgraded tier
+        lang = await get_client_language(int(target_id))
+        if lang == "en":
+            client_msg = f"🎉 <b>Package Upgraded!</b>\nYour account has been updated to <b>{tier_name}</b>. Enjoy your new features!"
+        else:
+            client_msg = f"🎉 <b>ፓኬጅዎ ተሻሽሏል! / Package Upgraded!</b>\nመለያዎ ወደ <b>{tier_name}</b> ከፍ ብሏል። እንኳን ደስ አለዎት!"
+
+        await send_message_safely(context, chat_id=int(target_id), text=client_msg, parse_mode="HTML")
+        await update.message.reply_text(f"✅ Successfully updated client `{target_id}` to **{tier_name}**!")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Failed to update package in database: {e}")
+
 async def admin_client_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Instantly lookup a client's stats in Supabase."""
     user_id = update.effective_user.id
@@ -519,12 +557,31 @@ async def handle_upgrade_payment_info(update: Update, context: ContextTypes.DEFA
     await query.message.reply_text(text, parse_mode="HTML")
 
 # ------------------------------------------------------------------
-# DYNAMIC CHECK-IN FLOW
+# DYNAMIC CHECK-IN FLOW (With Same-Day Guard)
 # ------------------------------------------------------------------
 async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+
+    try:
+        # Guard: Check if already checked in today
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        existing_today = (
+            supabase.table("daily_logs")
+            .select("id")
+            .eq("client_id", user_id)
+            .gte("created_at", today_start)
+            .execute()
+        )
+        if existing_today.data:
+            await query.message.reply_text(
+                "✅ <b>You've already checked in today! / ዛሬ ቀድመው ተመዝግበዋል!</b>\nAwesome dedication. Come back tomorrow to keep your streak going! 🔥",
+                parse_mode="HTML"
+            )
+            return
+    except Exception as e:
+        logging.error(f"Error checking duplicate check-in: {e}")
 
     try:
         res = supabase.table("clients").select("goal").eq("id", user_id).execute()
@@ -717,6 +774,7 @@ async def post_init(application):
     scheduler = AsyncIOScheduler()
     scheduler.add_job(send_sunday_admin_report, "cron", day_of_week="sun", hour=8, minute=0, args=[application])
     scheduler.add_job(check_expirations_and_streaks, "cron", hour=9, minute=0, args=[application])
+    # Friendly daily reminder job scheduled at 8:00 PM EAT every day
     scheduler.add_job(send_daily_checkin_reminders, "cron", hour=20, minute=0, timezone=EAT_TIMEZONE, args=[application])
     scheduler.start()
 
@@ -728,6 +786,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
 
     # Admin Commands
+    app.add_handler(CommandHandler("setpackage", admin_set_package))
     app.add_handler(CommandHandler("clientinfo", admin_client_info))
     app.add_handler(CommandHandler("sendplan", admin_send_plan))
     app.add_handler(CommandHandler("senddoc", admin_send_document))
@@ -748,7 +807,7 @@ def main():
     # Media & Text Handlers
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_client_attachments))
 
-    print("⚡ Bot #2 is live with blocked-client handling and /clientinfo...")
+    print("⚡ Bot #2 is live with /setpackage, same-day guard, and friendly check-in reminders...")
     app.run_polling()
 
 if __name__ == "__main__":
