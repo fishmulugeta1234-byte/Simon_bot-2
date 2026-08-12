@@ -210,24 +210,42 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
 
 async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
     try:
-        res = supabase.table("clients").select("id, package, created_at, renewal_notified").eq("is_active", True).execute()
+        res = supabase.table("clients").select("id, package, created_at, renewal_notified, testimonial_notified").eq("is_active", True).execute()
         if not res.data: return
         now = datetime.now(timezone.utc)
+        
         for client in res.data:
             c_id = client["id"]
-            if client.get("package", "Meal Plan Only") == "Meal Plan Only" or client.get("renewal_notified"):
+            pkg = client.get("package", "Meal Plan Only")
+            if pkg == "Meal Plan Only":
                 continue
 
             days_active = (now - parse_supabase_timestamp(client["created_at"])).days
-            if days_active >= 57:
+
+            # 1. Testimonial Prompt on Program Completion (e.g., around Day 21, 60, 90, 180 based on package)
+            completion_days = 21 if "Kickstart" in pkg else (60 if "Transformation" in pkg else (90 if "Lifestyle" in pkg else 180))
+            if days_active >= completion_days and not client.get("testimonial_notified"):
+                testimonial_text = (
+                    "🏆 <b>እንኳን ደስ አለዎት! ሌቭሉን በድል ጨርሰዋል! 🔥</b>\n\n"
+                    "ቆይታዎ እንዴት እንደነበረ እና ምን ያህል እንደተለወጡ ማየት ለኛ ትልቅ ደስታ ነው! እጅግ አስደናቂ ሥራ ሠርተዋል 💪\n\n"
+                    "በፕሮግራሙ ላይ የነበረዎትን አጠቃላይ ልምድ እና ያገኙትን ለውጥ አጭር የቪዲዮ ወይም የጽሑፍ ምስክርነት (Testimonial) ቢያጋሩን በጣም ደስ ይለናል።"
+                )
+                success = await send_message_safely(context, chat_id=c_id, parse_mode="HTML", text=testimonial_text)
+                if success:
+                    supabase.table("clients").update({"testimonial_notified": True}).eq("id", c_id).execute()
+                await asyncio.sleep(0.05)
+
+            # 2. Expiry & Renewal Warning (around Day 57 for 60-day programs, etc.)
+            if not client.get("renewal_notified") and days_active >= (completion_days - 3):
                 success = await send_message_safely(
                     context, chat_id=c_id, parse_mode="HTML",
-                    text="⚠️ <b>የኮቺንግ ፓኬጅዎ በ3 ቀናት ውስጥ ይጠናቀቃል! / Package Expires in 3 Days!</b>\nእቅዶችዎን እና ክትትልዎን መቀጠል እንዲችሉ ከታች በመጫን ያድሱ:",
+                    text="⚠️ <b>የኮቺንግ ፓኬጅዎ በቅርቡ ይጠናቀቃል! / Package Expiring Soon!</b>\nእቅዶችዎን እና ክትትልዎን መቀጠል እንዲችሉ ከታች በመጫን ያድሱ:",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 ፓኬጅ ማደሻ / Renew Package", callback_data="upgrade_tier")]])
                 )
                 if success:
                     supabase.table("clients").update({"renewal_notified": True}).eq("id", c_id).execute()
                 await asyncio.sleep(0.05)
+
     except Exception as e:
         logging.error(f"Error checking expirations: {e}")
 
