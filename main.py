@@ -1,4 +1,5 @@
 import os
+import html
 import logging
 import asyncio
 from collections import defaultdict
@@ -73,6 +74,15 @@ async def start_web_server():
 # ------------------------------------------------------------------
 # HELPERS
 # ------------------------------------------------------------------
+def esc(value) -> str:
+    """Escape user-supplied text before interpolating into an HTML parse_mode message.
+    Unescaped '<', '>', '&' in a name/note/question crashes send_message with
+    telegram.error.BadRequest: Can't parse entities — same failure as the /sendplan
+    usage-string bug, but triggered by client input instead of our own code."""
+    if value is None:
+        return ""
+    return html.escape(str(value))
+
 async def get_client_language(user_id: int) -> str:
     try:
         res = supabase.table("clients").select("language").eq("id", user_id).execute()
@@ -211,7 +221,7 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
         for client in clients:
             streak = len(logs_by_client.get(client["id"], set()))
             icon = "💪" if client.get("goal") == "goal_muscle" else "🔥"
-            report_lines.append(f"{icon} <b>{client.get('full_name', 'Client')}</b> ({client.get('package', 'N/A')})\n• Adherence: {streak} / 7 Days Logged\n")
+            report_lines.append(f"{icon} <b>{esc(client.get('full_name', 'Client'))}</b> ({esc(client.get('package', 'N/A'))})\n• Adherence: {streak} / 7 Days Logged\n")
 
         for admin_id in ADMIN_USER_IDS:
             await send_message_safely(context, chat_id=admin_id, text="\n".join(report_lines), parse_mode="HTML")
@@ -332,7 +342,7 @@ async def admin_client_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         checkins = len(supabase.table("daily_logs").select("id").eq("client_id", c["id"]).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data or [])
         
         info = (
-            f"👤 <b>INFO: {c.get('full_name')}</b>\n"
+            f"👤 <b>INFO: {esc(c.get('full_name'))}</b>\n"
             f"• <b>ID:</b> {c['id']}\n• <b>Package:</b> {c.get('package')}\n"
             f"• <b>Goal:</b> {c.get('goal')}\n• <b>Active:</b> {days} days\n"
             f"• <b>7-Day Checkins:</b> {checkins}/7\n"
@@ -409,7 +419,9 @@ async def admin_status_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     
     try:
-        res = supabase.table("clients").select("full_name, package, is_active, plan_ready").execute()
+        # FIX: order by created_at so "Last 5 Registrations" is actually the most
+        # recent signups, not just whatever 5 rows Supabase happened to return last
+        res = supabase.table("clients").select("full_name, package, is_active, plan_ready, created_at").order("created_at", desc=True).execute()
         clients = res.data or []
         
         total = len(clients)
@@ -425,9 +437,9 @@ async def admin_status_command(update: Update, context: ContextTypes.DEFAULT_TYP
             f"<b>Last 5 Registrations:</b>\n"
         )
         
-        for client in clients[-5:]:
-            name = client.get("full_name", "Unknown")
-            pkg = client.get("package", "Standard")
+        for client in clients[:5]:
+            name = esc(client.get("full_name", "Unknown"))
+            pkg = esc(client.get("package", "Standard"))
             status = "🟢" if client.get("is_active") else "🔴"
             text += f"• {status} {name} | <i>{pkg}</i>\n"
             
@@ -565,10 +577,10 @@ async def handle_client_profile(update: Update, context: ContextTypes.DEFAULT_TY
         checkins = len(supabase.table("daily_logs").select("id").eq("client_id", c["id"]).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data or [])
         
         if lang == "en":
-            text = (f"👤 <b>YOUR COACHING PROFILE</b>\n\n• <b>Name:</b> {c.get('full_name')}\n• <b>Package:</b> {c.get('package')}\n"
+            text = (f"👤 <b>YOUR COACHING PROFILE</b>\n\n• <b>Name:</b> {esc(c.get('full_name'))}\n• <b>Package:</b> {c.get('package')}\n"
                     f"• <b>Goal:</b> {c.get('goal')}\n• <b>Days Active:</b> {days}\n• <b>7-Day Check-ins:</b> {checkins}/7\n")
         else:
-            text = (f"👤 <b>የኮቺንግ መለያዎ / YOUR PROFILE</b>\n\n• <b>ስም:</b> {c.get('full_name')}\n• <b>የፓኬጅ ዓይነት:</b> {c.get('package')}\n"
+            text = (f"👤 <b>የኮቺንግ መለያዎ / YOUR PROFILE</b>\n\n• <b>ስም:</b> {esc(c.get('full_name'))}\n• <b>የፓኬጅ ዓይነት:</b> {c.get('package')}\n"
                     f"• <b>ዋና ግብ:</b> {c.get('goal')}\n• <b>የቆይታ ጊዜ:</b> {days} ቀናት\n• <b>የ7 ቀን ክትትል:</b> {checkins}/7 ቀናት\n")
         await query.message.reply_text(text, parse_mode="HTML")
     except Exception:
@@ -807,7 +819,7 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
             
             await update.message.reply_text(
                 f"🎉 <b>ክትትልዎ እና ማስታወሻዎ ተመዝግበዋል! / Check-In Completed!</b>\n"
-                f"ማስታወሻ፦ <i>{note}</i>\n"
+                f"ማስታወሻ፦ <i>{esc(note)}</i>\n"
                 f"ሳይመን progressዎን በቅርቡ ይገመግማል{celeb}",
                 parse_mode="HTML"
             )
@@ -816,7 +828,7 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
             for a_id in ADMIN_USER_IDS:
                 await send_message_safely(
                     context, chat_id=a_id,
-                    text=f"📊 <b>DAILY CHECK-IN NOTE: {u.full_name}</b>\n• Nutrition: {nut}\n• Recovery/Hydration: {second}\n• Note: <i>{note}</i>",
+                    text=f"📊 <b>DAILY CHECK-IN NOTE: {esc(u.full_name)}</b>\n• Nutrition: {nut}\n• Recovery/Hydration: {second}\n• Note: <i>{esc(note)}</i>",
                     parse_mode="HTML"
                 )
         except Exception:
@@ -849,7 +861,7 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
         if update.message.photo and context.user_data.get("awaiting_payment_screenshot"):
             context.user_data["awaiting_payment_screenshot"] = False
             req_tier = context.user_data.get("pending_tier", "Transformation (60 Days)")
-            txt = f"🚨 <b>PAYMENT RECEIPT!</b>\nClient: {u.full_name} (<code>{u.id}</code>)\nTier: {req_tier}"
+            txt = f"🚨 <b>PAYMENT RECEIPT!</b>\nClient: {esc(u.full_name)} (<code>{u.id}</code>)\nTier: {req_tier}"
             kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Approve & Set {req_tier}", callback_data=f"approve_tier_{u.id}_{req_tier[:3]}")]])
             for a_id in ADMIN_USER_IDS:
                 try: await context.bot.send_photo(chat_id=a_id, photo=f_id, caption=txt, reply_markup=kb, parse_mode="HTML")
@@ -865,7 +877,7 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
         except Exception: pass
 
         if perms.get("priority"):
-            for a_id in ADMIN_USER_IDS: await send_message_safely(context, chat_id=a_id, text=f"🚨 <b>VIP QUESTION!</b>\nClient: {u.full_name}\nTier: {tier}\nMessage: {update.message.text.strip()}", parse_mode="HTML")
+            for a_id in ADMIN_USER_IDS: await send_message_safely(context, chat_id=a_id, text=f"🚨 <b>VIP QUESTION!</b>\nClient: {esc(u.full_name)}\nTier: {tier}\nMessage: {esc(update.message.text.strip())}", parse_mode="HTML")
             await update.message.reply_text("Your VIP message has been routed directly to ሳይመን!")
         else:
             await update.message.reply_text("Question saved! 📝 ሳይመን will address this in your next check-in.", parse_mode="HTML")
