@@ -509,7 +509,7 @@ async def handle_target_plan(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.message.reply_text("⚠️ Error fetching plans.")
 
 # ------------------------------------------------------------------
-# UPGRADE & PAYMENT FLOW (UPDATED WITH NEW USD PRICES & LOCAL ETB)
+# UPGRADE & PAYMENT FLOW (WITH ERROR SAFETY & DYNAMIC CURRENCY)
 # ------------------------------------------------------------------
 async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -521,8 +521,8 @@ async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TY
         res = supabase.table("clients").select("location_type").eq("id", u_id).execute()
         if res.data and len(res.data) > 0:
             loc_type = res.data[0].get("location_type", "et")
-    except Exception:
-        pass
+    except Exception as e:
+        logging.error(f"Error checking location_type for upgrade {u_id}: {e}")
 
     if loc_type == "et":
         keyboard = [
@@ -541,13 +541,16 @@ async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton("📲 Contact Simon", url="https://t.me/s_simon_19")]
         ]
 
-    await query.message.reply_text(
-        "🏋️ <b>ፓኬጅ ማሻሻያ / UPGRADE TO FULL COACHING</b>\n\n"
-        "ሙሉ የ 1-ለ-1 ክትትል፣ የፎርም ግምገማ፣ የድምጽ ኦዲት እና የተስተካከሉ እቅዶችን ያግኙ!\n"
-        "Unlock full 1-on-1 coaching, form reviews, voice audits, and custom plans!\n\n"
-        "ከታች የሚፈልጉትን ፓኬጅ ይምረጡ / Select your tier below:",
-        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
-    )
+    try:
+        await query.message.reply_text(
+            "🏋️ <b>ፓኬጅ ማሻሻያ / UPGRADE TO FULL COACHING</b>\n\n"
+            "ሙሉ የ 1-ለ-1 ክትትል፣ የፎርም ግምገማ፣ የድምጽ ኦዲት እና የተስተካከሉ እቅዶችን ያግኙ!\n"
+            "Unlock full 1-on-1 coaching, form reviews, voice audits, and custom plans!\n\n"
+            "ከታች የሚፈልጉትን ፓኬጅ ይምረጡ / Select your tier below:",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
+        )
+    except Exception as err:
+        logging.error(f"Failed to render upgrade menu for {u_id}: {err}")
 
 async def handle_upgrade_payment_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -590,7 +593,7 @@ async def handle_upgrade_payment_info(update: Update, context: ContextTypes.DEFA
     await query.message.reply_text(text, parse_mode="HTML")
 
 # ------------------------------------------------------------------
-# DAILY CHECK-IN FLOW
+# DAILY CHECK-IN FLOW (WITH ERROR SAFETY)
 # ------------------------------------------------------------------
 async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -603,8 +606,11 @@ async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TY
             await query.message.reply_text("✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nአስደናቂ ወጥነት! Streak እንዳይቋረጥ ነገ ይመለሱ! 🔥", parse_mode="HTML")
             return
             
-        goal = supabase.table("clients").select("goal").eq("id", u_id).execute().data[0].get("goal")
-    except Exception: goal = "goal_fat_loss"
+        res = supabase.table("clients").select("goal").eq("id", u_id).execute()
+        goal = res.data[0].get("goal") if res.data else "goal_fat_loss"
+    except Exception as e:
+        logging.error(f"Error in trigger_daily_checkin for {u_id}: {e}")
+        goal = "goal_fat_loss"
 
     if goal == "goal_muscle":
         kb = [[InlineKeyboardButton("🎯 ፕሮቲን እና ካሎሪ ሞልቻለሁ", callback_data="log_nut_hit")], [InlineKeyboardButton("⚠️ ፕሮቲን/ካሎሪ አጎድያለሁ", callback_data="log_nut_miss")]]
@@ -613,7 +619,10 @@ async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TY
         kb = [[InlineKeyboardButton("🎯 የካሎሪ ገደብ ጠብቄአለሁ", callback_data="log_nut_hit")], [InlineKeyboardButton("⚠️ የካሎሪ ገደብ አልጠበቅሁም", callback_data="log_nut_miss")]]
         text = "🔔 <b>የስብ መቀነስ ክትትል / FAT LOSS CHECK-IN</b>\nየካሎሪ ገደብዎን ጠብቀዋል? / Did you stay within your calorie deficit?"
 
-    await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+    try:
+        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+    except Exception as err:
+        logging.error(f"Failed to send checkin prompt to {u_id}: {err}")
 
 async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
