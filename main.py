@@ -267,7 +267,7 @@ async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
 async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS: return
     if not context.args:
-        await update.message.reply_text("⚠️ Usage: `/broadcast <message>`", parse_mode="HTML")
+        await update.message.reply_text("⚠️ Usage: `/broadcast [message]`", parse_mode="HTML")
         return
 
     # FIX: context.args is whitespace-tokenized, which collapses newlines the admin
@@ -345,7 +345,7 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2 or not doc:
         await update.message.reply_text(
             "⚠️ Usage: Send the file first (no caption), then reply to it with "
-            "`/sendplan <client_id> <meal|workout>`",
+            "`/sendplan [client_id] [meal|workout]`",
             parse_mode="HTML"
         )
         return
@@ -370,9 +370,13 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "plan_ready": True
         }).eq("id", c_id).execute()
 
+        # FIX: give the client a tappable button instead of telling them to "open the
+        # main menu" with no way to actually do that besides typing /start manually
+        menu_markup = await get_main_menu_markup(c_id)
         await send_message_safely(
             context, chat_id=c_id, parse_mode="HTML",
-            text=f"🎉 <b>አዲስ የ{p_type.capitalize()} እቅድ ተጭኗል! / New Plan Updated!</b>\nሳይመን አዲስ እቅድዎን ልኮልዎታል። ለማየት ዋናውን menu ይክፈቱ!"
+            text=f"🎉 <b>አዲስ የ{p_type.capitalize()} እቅድ ተጭኗል! / New Plan Updated!</b>\nሳይመን አዲስ እቅድዎን ልኮልዎታል! ከታች ይምረጡ:",
+            reply_markup=menu_markup
         )
         await update.message.reply_text(f"✅ Successfully linked {p_type} plan and unlocked client `{c_id}`!", parse_mode="HTML")
     except Exception as e:
@@ -430,7 +434,7 @@ async def admin_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not context.args or not doc:
         await update.message.reply_text(
-            "⚠️ Usage: Send the file first (no caption), then reply to it with `/sendfile <client_id>`",
+            "⚠️ Usage: Send the file first (no caption), then reply to it with `/sendfile [client_id]`",
             parse_mode="HTML"
         )
         return
