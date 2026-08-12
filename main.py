@@ -290,6 +290,7 @@ async def admin_client_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• <b>Goal:</b> {c.get('goal')}\n• <b>Active:</b> {days} days\n"
             f"• <b>7-Day Checkins:</b> {checkins}/7\n"
             f"• <b>Status:</b> {'🟢' if c.get('is_active') else '🔴'}\n"
+            f"• <b>Plan Ready:</b> {'✅ Yes' if c.get('plan_ready') else '⏳ Pending'}\n"
         )
         await update.message.reply_text(info, parse_mode="HTML")
     except Exception as e:
@@ -305,12 +306,13 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     col = "meal_plan_url" if p_type == "meal" else "workout_plan_url"
     
     try:
-        supabase.table("clients").update({col: update.message.document.file_id}).eq("id", c_id).execute()
+        # Automatically set plan_ready to True when you upload a plan!
+        supabase.table("clients").update({col: update.message.document.file_id, "plan_ready": True}).eq("id", c_id).execute()
         await send_message_safely(
             context, chat_id=c_id, parse_mode="HTML",
             text=f"🎉 <b>አዲስ የ{p_type.capitalize()} እቅድ ተጭኗል! / New Plan Updated!</b>\nሳይመን አዲስ እቅድዎን ልኮልዎታል። ለማየት ዋናውን menu ይክፈቱ!"
         )
-        await update.message.reply_text("✅ Plan updated!")
+        await update.message.reply_text("✅ Plan updated and client gatekeeper unlocked!")
     except Exception as e:
         await update.message.reply_text(f"⚠️ Failed: {e}")
 
@@ -324,7 +326,7 @@ async def admin_send_voice_feedback(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text(f"⚠️ Failed: {e}")
 
 # ------------------------------------------------------------------
-# CLIENT COMMANDS & VIEWS
+# CLIENT COMMANDS & VIEWS (WITH GATEKEEPER CHECK)
 # ------------------------------------------------------------------
 async def get_main_menu_markup(user_id: int):
     lang = await get_client_language(user_id)
@@ -346,7 +348,48 @@ async def get_main_menu_markup(user_id: int):
         ])
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    markup = await get_main_menu_markup(update.effective_user.id)
+    user_id = update.effective_user.id
+    
+    # 🛡️ GATEKEEPER CHECK: See if plan_ready is True or False in Supabase
+    try:
+        res = supabase.table("clients").select("plan_ready, language").eq("id", user_id).execute()
+        if res.data and len(res.data) > 0:
+            client_record = res.data[0]
+            plan_is_ready = client_record.get("plan_ready", False)
+            lang = client_record.get("language", "am")
+        else:
+            plan_is_ready = False
+            lang = "am"
+    except Exception as e:
+        logging.error(f"Gatekeeper check error for {user_id}: {e}")
+        plan_is_ready = False
+        lang = "am"
+
+    # If plan is NOT ready yet, show the waiting screen
+    if not plan_is_ready:
+        if lang == "am":
+            wait_text = (
+                "⏳ <b>ዕቅድዎ በመዘጋጀት ላይ ይገኛል!</b>\n\n"
+                "📋 ሰላም! መረጃዎ እና ክፍያዎ ተረጋግጦ ወደ ሲስተሙ ገብቷል። ሳይመን አሁን ለእርስዎ የሚስማማውን ልዩ የስፖርት እና የምግብ ዕቅድ በጥንቃቄ በማዘጋጀት ላይ ይገኛል።\n\n"
+                "⏰ ዕቅድዎ ሲጠናቀቅ እና ወደ ቦቱ ሲጫን በቀጥታ ማሳወቂያ (Notification) ይደርስዎታል!\n\n"
+                "<i>(Hello! Your intake and payment are confirmed. Simon is currently building your customized plan. You will receive an instant notification here the moment it goes live!)</i>"
+            )
+        else:
+            wait_text = (
+                "⏳ <b>Your Plan is Under Construction!</b>\n\n"
+                "📋 Hello! Your intake and payment are confirmed. Simon is currently building your customized workout and nutrition plan with care.\n\n"
+                "⏰ You will receive an instant notification here the moment your plan is finalized and uploaded!\n\n"
+                "<i>(ሰላም! መረጃዎ እና ክፍያዎ ተረጋግጦ ወደ ሲስተሙ ገብቷል። ሳይመን አሁን ዕቅድዎን እያዘጋጀ ነው።)</i>"
+            )
+        
+        support_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📲 ከሳይመን ጋር መነጋገር / Contact Simon", url="https://t.me/s_simon_19")]
+        ])
+        await update.message.reply_text(wait_text, reply_markup=support_markup, parse_mode="HTML")
+        return
+
+    # If plan IS ready, open the full portal normally!
+    markup = await get_main_menu_markup(user_id)
     await update.message.reply_text(
         "እንኳን ወደ ሲሞን ኦሪጅን የክትትል እና ኮቺንግ ፖርታል በደህና መጡ! 🎯\n"
         "Welcome to Simon Origin Tracking & Coaching Portal! 🎯\n\n"
@@ -613,7 +656,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_client_attachments))
 
-    print("⚡ Bot #2 is LIVE! Triple Motivation Schedule (8AM, 8PM, 10:30PM) active.")
+    print("⚡ Bot #2 with Gatekeeper is LIVE! Triple Motivation Schedule active.")
     app.run_polling()
 
 if __name__ == "__main__":
