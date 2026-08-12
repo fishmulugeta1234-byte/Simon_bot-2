@@ -46,7 +46,7 @@ EAT_TIMEZONE = ZoneInfo("Africa/Addis_Ababa")
 # TIER PERMISSIONS DEFINITION (SYNCHRONIZED WITH BOT 1)
 # ------------------------------------------------------------------
 TIER_PERMISSIONS = {
-    "Meal Plan Only": {"allow_media": False, "allow_qa": False, "priority": False},
+    "Meal Plan Only (2 Months)": {"allow_media": False, "allow_qa": False, "priority": False},
     "Kickstart (21 Days)": {"allow_media": False, "allow_qa": True, "priority": False},
     "Transformation (60 Days)": {"allow_media": True, "allow_qa": True, "priority": False},
     "Elite Transformation (90 Days)": {"allow_media": True, "allow_qa": True, "priority": True},
@@ -114,7 +114,7 @@ async def send_morning_motivation(context: ContextTypes.DEFAULT_TYPE):
         if not res.data:
             return
             
-        clients = [c for c in res.data if c.get("package", "Meal Plan Only") != "Meal Plan Only"]
+        clients = [c for c in res.data if "Meal Plan Only" not in c.get("package", "")]
         text = (
             "☀️ <b>Main Character Energy! / አዲስ ቀን፣ አዲስ ሌቭል!</b>\n\n"
             "ዛሬ ቀኑን በድል እንወጣዋለን! ሌቭል-አፕ ለማድረግ ዛሬም በጉልበትና በቁርጠኝነት እንነሳ! 🎮🔥\n\n"
@@ -134,7 +134,7 @@ async def send_daily_checkin_reminders(context: ContextTypes.DEFAULT_TYPE):
         if not res.data:
             return
 
-        clients = [c for c in res.data if c.get("package", "Meal Plan Only") != "Meal Plan Only"]
+        clients = [c for c in res.data if "Meal Plan Only" not in c.get("package", "")]
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         
         logs_res = supabase.table("daily_logs").select("client_id").in_("client_id", [c["id"] for c in clients]).gte("created_at", today_start).execute()
@@ -162,7 +162,7 @@ async def send_late_night_reminders(context: ContextTypes.DEFAULT_TYPE):
         if not res.data:
             return
 
-        clients = [c for c in res.data if c.get("package", "Meal Plan Only") != "Meal Plan Only"]
+        clients = [c for c in res.data if "Meal Plan Only" not in c.get("package", "")]
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         
         logs_res = supabase.table("daily_logs").select("client_id").in_("client_id", [c["id"] for c in clients]).gte("created_at", today_start).execute()
@@ -187,7 +187,7 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
     try:
         res = supabase.table("clients").select("id, full_name, package, goal").eq("is_active", True).execute()
         if not res.data: return
-        clients = [c for c in res.data if c.get("package", "Meal Plan Only") != "Meal Plan Only"]
+        clients = [c for c in res.data if "Meal Plan Only" not in c.get("package", "")]
         if not clients: return
 
         seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
@@ -217,17 +217,15 @@ async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
         
         for client in res.data:
             c_id = client["id"]
-            pkg = client.get("package", "Meal Plan Only")
-            if pkg == "Meal Plan Only":
-                continue
-
+            pkg = client.get("package", "Meal Plan Only (2 Months)")
             days_active = (now - parse_supabase_timestamp(client["created_at"])).days
 
-            # Dynamic completion days based on synchronized tiers
+            # Dynamic completion days based on synchronized tiers (Meal Plan Only is 60 days)
             completion_days = (
-                21 if "Kickstart" in pkg else 
+                60 if "Meal Plan Only" in pkg else
+                (21 if "Kickstart" in pkg else 
                 (60 if "Transformation" in pkg else 
-                (90 if "Elite" in pkg else 180))
+                (90 if "Elite" in pkg else 180)))
             )
             
             if days_active >= completion_days and not client.get("testimonial_notified"):
@@ -417,7 +415,7 @@ async def get_main_menu_markup(user_id: int):
         ])
     else:
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📖 የእኔ እቅድ / My Target Plan", callback_data="get_target_plan")],
+            [InlineKeyboardButton("📖 የእንድ እቅድ / My Target Plan", callback_data="get_target_plan")],
             [InlineKeyboardButton("👤 መለያዬ / My Profile", callback_data="get_client_profile")],
             [InlineKeyboardButton("📊 የዕለት ክትትል / Daily Check-In", callback_data="start_checkin")],
             [InlineKeyboardButton("🔄 ፓኬጅ ማሻሻያ / Upgrade Package", callback_data="upgrade_tier")],
@@ -518,14 +516,15 @@ async def handle_target_plan(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not res.data: return
         c = res.data[0]
         
-        await query.message.reply_text("📋 <b>NUTRITION BLUEPRINT / የምግብ እቅድ</b>" if c.get("package") == "Meal Plan Only" else "📋 <b>FULL COACHING BLUEPRINT / የኮቺንግ እቅድ</b>", parse_mode="HTML")
+        is_meal_only = "Meal Plan Only" in c.get("package", "")
+        await query.message.reply_text("📋 <b>NUTRITION BLUEPRINT / የምግብ እቅድ</b>" if is_meal_only else "📋 <b>FULL COACHING BLUEPRINT / የኮቺንግ እቅድ</b>", parse_mode="HTML")
         
         if c.get("meal_plan_url"):
             await context.bot.send_document(chat_id=query.from_user.id, document=c["meal_plan_url"], caption="🔗 Meal Plan")
         else:
             await query.message.reply_text("🔗 Meal Plan: Not Uploaded Yet" if lang == "en" else "🔗 የምግብ እቅድ፦ እስካሁን አልተጫነም")
             
-        if c.get("package") != "Meal Plan Only":
+        if not is_meal_only:
             if c.get("workout_plan_url"):
                 await context.bot.send_document(chat_id=query.from_user.id, document=c["workout_plan_url"], caption="🏋️ Workout Plan")
             else:
@@ -696,10 +695,10 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
 
     try:
         c = supabase.table("clients").select("package, full_name").eq("id", u.id).execute().data[0]
-        tier = c.get("package", "Meal Plan Only")
-    except Exception: tier = "Meal Plan Only"
+        tier = c.get("package", "Meal Plan Only (2 Months)")
+    except Exception: tier = "Meal Plan Only (2 Months)"
 
-    perms = TIER_PERMISSIONS.get(tier, TIER_PERMISSIONS["Meal Plan Only"])
+    perms = TIER_PERMISSIONS.get(tier, TIER_PERMISSIONS["Meal Plan Only (2 Months)"])
 
     if update.message.photo or update.message.video or update.message.voice:
         if not perms["allow_media"] and not update.message.photo:
