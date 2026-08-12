@@ -317,23 +317,37 @@ async def admin_client_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Error: {e}")
 
 async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_USER_IDS: return
+    if update.effective_user.id not in ADMIN_USER_IDS: 
+        return
+        
     if len(context.args) < 2 or not update.message.document:
-        await update.message.reply_text("Send document with `/sendplan <client_id> <meal|workout>`")
+        await update.message.reply_text("⚠️ Usage: Reply to a document with `/sendplan <client_id> <meal|workout>`", parse_mode="HTML")
         return
 
-    c_id, p_type = context.args[0], context.args[1].lower()
+    try:
+        c_id = int(context.args[0])
+        p_type = context.args[1].lower()
+    except ValueError:
+        await update.message.reply_text("❌ Error: Client ID must be a valid number.")
+        return
+
     col = "meal_plan_url" if p_type == "meal" else "workout_plan_url"
+    file_id = update.message.document.file_id
     
     try:
-        supabase.table("clients").update({col: update.message.document.file_id, "plan_ready": True}).eq("id", c_id).execute()
+        supabase.table("clients").update({
+            col: file_id, 
+            "plan_ready": True
+        }).eq("id", c_id).execute()
+
         await send_message_safely(
             context, chat_id=c_id, parse_mode="HTML",
             text=f"🎉 <b>አዲስ የ{p_type.capitalize()} እቅድ ተጭኗል! / New Plan Updated!</b>\nሳይመን አዲስ እቅድዎን ልኮልዎታል። ለማየት ዋናውን menu ይክፈቱ!"
         )
-        await update.message.reply_text("✅ Plan updated and client gatekeeper unlocked!")
+        await update.message.reply_text(f"✅ Successfully linked {p_type} plan and unlocked client `{c_id}`!", parse_mode="HTML")
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Failed: {e}")
+        logging.error(f"Failed to update plan in Supabase for client {c_id}: {e}")
+        await update.message.reply_text(f"⚠️ Database Failed: {e}")
 
 async def admin_send_voice_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS: return
