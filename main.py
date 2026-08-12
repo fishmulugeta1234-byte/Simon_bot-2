@@ -627,11 +627,16 @@ async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TY
     ]
 
     rows = tier_rows_et if loc_type == "et" else tier_rows_intl
-    keyboard = [
-        [InlineKeyboardButton(label, callback_data=cb)]
-        for (tier_name, label, cb) in rows
-        if tier_name != current_package
-    ]
+    keyboard = []
+    for (tier_name, label, cb) in rows:
+        # FIX: keep the client's current tier visible but relabeled as a renewal —
+        # this button is reused both for mid-program upgrades and for the
+        # "Package Expiring Soon" renewal prompt, and a client finishing their
+        # program usually wants to buy the SAME tier again, not just a higher one
+        if tier_name == current_package:
+            keyboard.append([InlineKeyboardButton(f"{label} (🔁 Renew Same Plan)", callback_data=cb)])
+        else:
+            keyboard.append([InlineKeyboardButton(label, callback_data=cb)])
     contact_label = "📲 ከሳይመን ጋር መነጋገር" if loc_type == "et" else "📲 Contact Simon"
     keyboard.append([InlineKeyboardButton(contact_label, url="https://t.me/s_simon_19")])
 
