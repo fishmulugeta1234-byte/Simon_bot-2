@@ -144,7 +144,7 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
             log_date = parse_supabase_timestamp(log["created_at"]).date()
             logs_by_client[log["client_id"]].add(log_date)
 
-        report_lines = ["📥 <b>WEEKLY REVIEW QUEUE FOR COACH SIMON</b>\n"]
+        report_lines = ["📥 <b>WEEKLY REVIEW QUEUE FOR SCIENTIFIC SIMON</b>\n"]
 
         for client in clients:
             c_id = client["id"]
@@ -234,7 +234,7 @@ async def send_daily_checkin_reminders(context: ContextTypes.DEFAULT_TYPE):
             if lang == "en":
                 text = "🔥 <b>Evening Check-In Time!</b>\nDon't let your streak break today! Tap below to log your daily progress and keep the momentum rolling:"
             else:
-                text = "🔥 <b>የዕለት ክትትል ሰዓት ደርሷል! / Evening Check-In Time!</b>\nStreak እንዳይቋረጥ ዛሬ ያደረጉትን በመመዝገብቀጠሉን ያጠናክሩ! ከታች ይጫኑ:"
+                text = "🔥 <b>የዕለት ክትትል ሰዓት ደርሷል! / Evening Check-In Time!</b>\nStreak እንዳይቋረጥ ዛሬ ያደረጉትን በመመዝገብ ቀጠሉን ያጠናክሩ! ከታች ይጫኑ:"
 
             await send_message_safely(
                 context,
@@ -261,7 +261,7 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Usage: `/broadcast <your announcement message>`", parse_mode="HTML")
         return
 
-    broadcast_text = "📢 <b>ANNOUNCEMENT FROM COACH SIMON / ማስታወቂያ</b>\n\n" + " ".join(context.args)
+    broadcast_text = "📢 <b>ANNOUNCEMENT FROM ሳይመን / ማስታወቂያ</b>\n\n" + " ".join(context.args)
 
     try:
         res = supabase.table("clients").select("id").eq("is_active", True).execute()
@@ -278,7 +278,7 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             delivered = await send_message_safely(context, chat_id=c_id, text=broadcast_text, parse_mode="HTML")
             if delivered:
                 success_count += 1
-            await asyncio.sleep(0.05)  # Rate limiting safety delay
+            await asyncio.sleep(0.05)
 
         await status_msg.edit_text(f"✅ Broadcast complete! Successfully delivered to {success_count} / {len(client_ids)} active clients.")
     except Exception as e:
@@ -397,7 +397,7 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_message_safely(
             context,
             chat_id=target_client_id,
-            text=f"🎉 <b>አዲስ የ{plan_type.capitalize()} እቅድ ተጭኗል! / New Plan Updated!</b>\nኮች ሲሞን አዲስ እቅድዎን ልኮልዎታል። ለማየት ዋናውን ምናሌ ይክፈቱ!",
+            text=f"🎉 <b>አዲስ የ{plan_type.capitalize()} እቅድ ተጭኗል! / New Plan Updated!</b>\nሳይመን አዲስ እቅድዎን ልኮልዎታል። ለማየት ዋናውን menu ይክፈቱ!",
             parse_mode="HTML"
         )
         await update.message.reply_text("✅ Plan successfully updated and sent to the client!")
@@ -448,7 +448,7 @@ async def admin_send_voice_feedback(update: Update, context: ContextTypes.DEFAUL
         await context.bot.send_voice(
             chat_id=target_client_id,
             voice=voice_file_id,
-            caption="🎙️ <b>ከኮች ሲሞን የተላከ የድምጽ መልእክት / Voice Feedback from Coach</b>",
+            caption="🎙️ <b>ሳይመን የተላከ የድምጽ መልእክት / Voice Feedback from Coach</b>",
             parse_mode="HTML"
         )
         await update.message.reply_text("✅ Voice note delivered to client!")
@@ -585,7 +585,7 @@ async def handle_target_plan(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await context.bot.send_document(chat_id=user_id, document=meal_file_id, caption="🔗 Meal Plan")
             except Exception as send_err:
                 logging.error(f"Failed to send meal plan document to {user_id}: {send_err}")
-                await query.message.reply_text("⚠️ Could not send your meal plan file. Please contact Coach Simon.")
+                await query.message.reply_text("⚠️ Could not send your meal plan file. Please contact ሳይመን.")
         else:
             msg = "🔗 Meal Plan: Not Uploaded Yet" if lang == "en" else "🔗 የምግብ እቅድ፦ እስካሁን አልተጫነም"
             await query.message.reply_text(msg)
@@ -596,7 +596,7 @@ async def handle_target_plan(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     await context.bot.send_document(chat_id=user_id, document=workout_file_id, caption="🏋️ Workout Plan")
                 except Exception as send_err:
                     logging.error(f"Failed to send workout plan document to {user_id}: {send_err}")
-                    await query.message.reply_text("⚠️ Could not send your workout plan file. Please contact Coach Simon.")
+                    await query.message.reply_text("⚠️ Could not send your workout plan file. Please contact ሳይመን.")
             else:
                 msg = "🏋️ Workout Plan: Not Uploaded Yet" if lang == "en" else "🏋️ የአካል ብቃት እቅድ፦ እስካሁን አልተጫነም"
                 await query.message.reply_text(msg)
@@ -615,7 +615,7 @@ async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TY
     keyboard = [
         [InlineKeyboardButton("🔥 Transformation (60 Days)", callback_data="upgrade_60day")],
         [InlineKeyboardButton("⚡ Elite Transformation (90 Days)", callback_data="upgrade_90day")],
-        [InlineKeyboardButton("📲 Contact Coach Simon", url="https://t.me/s_simon_19")]
+        [InlineKeyboardButton("📲 Contact ሳይመን", url="https://t.me/s_simon_19")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -760,10 +760,10 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
             if streak_count in [7, 14, 30]:
                 celebration = f"\n\n🔥 <b>MILESTONE UNLOCKED! / ድንቅ ክንውን!</b> You hit a <b>{streak_count}-day check-in streak</b>!"
 
-            await query.message.reply_text(f"🎉 <b>Check-In Completed! / ክትትልዎ ተመዝግቧል!</b>\nCoach Simon will review your progress soon.{celebration}", parse_mode="HTML")
+            await query.message.reply_text(f"🎉 <b>Check-In Completed! / ክትትልዎ ተመዝግቧል!</b>\nሳይመን progressዎን በቅርቡ ይገመግማል{celebration}", parse_mode="HTML")
         except Exception as e:
             logging.error(f"Failed to record check-in: {e}")
-            await query.message.reply_text("🎉 <b>Check-In Completed!</b> Coach Simon will review your progress soon.", parse_mode="HTML")
+            await query.message.reply_text("🎉 <b>Check-In Completed!</b> ሳይመን progressዎን በቅርቡ ይገመግማል.", parse_mode="HTML")
         finally:
             context.user_data.pop("checkin_nut", None)
 
@@ -806,11 +806,9 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
             except Exception as db_err:
                 logging.error(f"Database error saving media: {db_err}")
 
-            await update.message.reply_text("Got it! 🎥 Your attachment has been saved for Coach Simon's review.", parse_mode="HTML")
+            await update.message.reply_text("Got it! 🎥 Your attachment has been saved for ሳይመን's review.", parse_mode="HTML")
 
-            # If it's a photo, alert admins with an interactive approval button for payment receipts
             if update.message.photo:
-                # Default to 60 Days Transformation if pending tier isn't found
                 target_tier = context.user_data.get("pending_tier", "Transformation (60 Days)")
                 vip_alert = (
                     f"🚨 <b>PAYMENT RECEIPT / የክፍያ ደረሰኝ!</b>\n"
@@ -850,9 +848,9 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
                 vip_alert = f"🚨 <b>INSTANT VIP QUESTION!</b>\nClient: {user.full_name}\nTier: {tier}\nMessage: {text_content}"
                 for admin_id in ADMIN_USER_IDS:
                     await send_message_safely(context, chat_id=admin_id, text=vip_alert, parse_mode="HTML")
-                await update.message.reply_text("Your VIP message has been routed directly to Coach Simon!")
+                await update.message.reply_text("Your VIP message has been routed directly to ሳይመን!")
             else:
-                await update.message.reply_text("Question saved! 📝 Coach Simon will address this in your next check-in.", parse_mode="HTML")
+                await update.message.reply_text("Question saved! 📝 ሳይመን will address this in your next check-in.", parse_mode="HTML")
 
     except Exception as e:
         logging.error(f"Unexpected error in message handler: {e}")
@@ -870,7 +868,7 @@ async def handle_admin_tier_approval(update: Update, context: ContextTypes.DEFAU
     if user_id not in ADMIN_USER_IDS:
         return
 
-    data = query.data  # e.g., approve_tier_1234567_Tra
+    data = query.data
     parts = data.split("_")
     if len(parts) < 4:
         return
@@ -878,7 +876,6 @@ async def handle_admin_tier_approval(update: Update, context: ContextTypes.DEFAU
     target_client_id = parts[2]
     tier_prefix = parts[3]
 
-    # Map abbreviation back to full tier name
     tier_map = {
         "Tra": "Transformation (60 Days)",
         "Eli": "Elite Transformation (90 Days)"
@@ -895,7 +892,7 @@ async def handle_admin_tier_approval(update: Update, context: ContextTypes.DEFAU
             client_msg = f"🎉 <b>ክፍያዎ ጸድቋል! / Payment Approved!</b>\nመለያዎ ወደ <b>{tier_name}</b> ከፍ ብሏል። እንኳን ደስ አለዎት!"
 
         await send_message_safely(context, chat_id=int(target_client_id), text=client_msg, parse_mode="HTML")
-        await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ <b>APPROVED BY COACH</b> ({tier_name})", parse_mode="HTML")
+        await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ <b>APPROVED BY ሳይመን</b> ({tier_name})", parse_mode="HTML")
     except Exception as e:
         await query.message.reply_text(f"⚠️ Failed to approve tier: {e}")
 
@@ -943,7 +940,7 @@ def main():
     # Media & Text Handlers
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_client_attachments))
 
-    print("⚡ Bot #2 is live with /broadcast, client profiles, and instant receipt approvals...")
+    print("⚡ Bot #2 is live with updated Amharic localization and branding...")
     app.run_polling()
 
 if __name__ == "__main__":
