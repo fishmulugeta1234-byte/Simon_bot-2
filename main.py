@@ -2,6 +2,7 @@ import os
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -36,6 +37,9 @@ for _name, _val in [("BOT_TOKEN", BOT_TOKEN), ("SUPABASE_URL", SUPABASE_URL), ("
         raise RuntimeError(f"Missing required environment variable: {_name}")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Ethiopia is UTC+3 year-round (no DST), used for the daily check-in reminder
+EAT_TIMEZONE = ZoneInfo("Africa/Addis_Ababa")
 
 # ------------------------------------------------------------------
 # TIER PERMISSIONS DEFINITION
@@ -178,6 +182,52 @@ async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
                     logging.error(f"Failed to send expiration notice to client {c_id}: {send_err}")
     except Exception as e:
         logging.error(f"Error checking expirations: {e}")
+
+async def send_daily_checkin_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """Nudges clients (who haven't already checked in today) to use the check-in feature."""
+    try:
+        res = supabase.table("clients").select("id, package, language").execute()
+        if not res.data:
+            return
+
+        clients = [c for c in res.data if c.get("package", "Meal Plan Only") != "Meal Plan Only"]
+        if not clients:
+            return
+
+        # Find who has already checked in today, so we don't nag people who already did it
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        client_ids = [c["id"] for c in clients]
+        logs_res = (
+            supabase.table("daily_logs")
+            .select("client_id")
+            .in_("client_id", client_ids)
+            .gte("created_at", today_start)
+            .execute()
+        )
+        already_checked_in = {log["client_id"] for log in (logs_res.data or [])}
+
+        for client in clients:
+            c_id = client["id"]
+            if c_id in already_checked_in:
+                continue
+
+            lang = client.get("language", "am")
+            if lang == "en":
+                text = "🔔 <b>Don't forget your daily check-in!</b>\nTap below to log today's progress:"
+            else:
+                text = "🔔 <b>የዕለት ክትትልዎን አይርሱ! / Don't forget your daily check-in!</b>\nዛሬ ያደረጉትን ለመመዝገብ ከታች ይጫኑ:"
+
+            try:
+                await context.bot.send_message(
+                    chat_id=c_id,
+                    text=text,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Check In Now", callback_data="start_checkin")]]),
+                    parse_mode="HTML"
+                )
+            except Exception as send_err:
+                logging.error(f"Failed to send check-in reminder to client {c_id}: {send_err}")
+    except Exception as e:
+        logging.error(f"Error sending daily check-in reminders: {e}")
 
 # ------------------------------------------------------------------
 # ADMIN FILE & VOICE NOTE DELIVERY HANDLERS
@@ -433,6 +483,23 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
         nut_status = context.user_data.get("checkin_nut", "Logged")
 
         try:
+            # Guard against duplicate check-ins on the same day inflating the streak count
+            today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            existing_today = (
+                supabase.table("daily_logs")
+                .select("id")
+                .eq("client_id", user_id)
+                .gte("created_at", today_start)
+                .execute()
+            )
+            if existing_today.data:
+                await query.message.reply_text(
+                    "✅ <b>You've already checked in today! / ዛሬ ቀድመው ተመዝግበዋል!</b>\nCome back tomorrow to keep your streak going.",
+                    parse_mode="HTML"
+                )
+                context.user_data.pop("checkin_nut", None)
+                return
+
             supabase.table("daily_logs").insert({
                 "client_id": user_id,
                 "nutrition_status": nut_status,
@@ -562,6 +629,7 @@ async def post_init(application):
     scheduler = AsyncIOScheduler()
     scheduler.add_job(send_sunday_admin_report, "cron", day_of_week="sun", hour=8, minute=0, args=[application])
     scheduler.add_job(check_expirations_and_streaks, "cron", hour=9, minute=0, args=[application])
+    scheduler.add_job(send_daily_checkin_reminders, "cron", hour=20, minute=0, timezone=EAT_TIMEZONE, args=[application])
     scheduler.start()
 
 def main():
