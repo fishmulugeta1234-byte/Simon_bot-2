@@ -407,9 +407,30 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_send_voice_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS: return
-    if not context.args or not update.message.voice: return
+
+    # FIX: same reply-fallback as /sendplan and /sendfile — accept a voice note either
+    # attached directly to the command, or on the message being replied to. Previously
+    # this only worked if the command was typed as the voice note's caption, which is
+    # fragile the same way /sendplan's caption-only flow was.
+    voice = update.message.voice or (
+        update.message.reply_to_message.voice if update.message.reply_to_message else None
+    )
+
+    if not context.args or not voice:
+        await update.message.reply_text(
+            "⚠️ Usage: Send the voice note first, then reply to it with `/reply [client_id]`",
+            parse_mode="HTML"
+        )
+        return
+
     try:
-        await context.bot.send_voice(chat_id=context.args[0], voice=update.message.voice.file_id, caption="🎙️ <b>ሳይመን የተላከ የድምጽ መልእክት / Voice Feedback from Coach</b>", parse_mode="HTML")
+        c_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Error: Client ID must be a valid number.")
+        return
+
+    try:
+        await context.bot.send_voice(chat_id=c_id, voice=voice.file_id, caption="🎙️ <b>ሳይመን የተላከ የድምጽ መልእክት / Voice Feedback from Coach</b>", parse_mode="HTML")
         await update.message.reply_text("✅ Voice note delivered!")
     except Exception as e:
         await update.message.reply_text(f"⚠️ Failed: {e}")
@@ -779,6 +800,10 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
         second = "Hit" if query.data == "log_second_hit" else "Missed"
         context.user_data["checkin_second"] = second
         context.user_data["awaiting_checkin_note"] = True
+        # FIX: timestamp this so a client who never answers doesn't have their next
+        # unrelated message (a real question, a photo) silently swallowed into a
+        # check-in note forever
+        context.user_data["awaiting_checkin_note_started_at"] = datetime.now(timezone.utc).isoformat()
 
         await query.message.reply_text(
             "✍️ <b>አጭር ማስታወሻ ወይም ጥያቄ ካለዎት ይጻፉልን (ከሌለ 'የለም' ይበሉ)፦</b>\n"
@@ -795,45 +820,65 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
 
     # Check if client is currently in the checkin note-writing step
     if context.user_data.get("awaiting_checkin_note"):
-        context.user_data["awaiting_checkin_note"] = False
-        note = update.message.text.strip() if update.message.text else "No note"
-        nut = context.user_data.pop("checkin_nut", "Logged")
-        second = context.user_data.pop("checkin_second", "Logged")
+        # FIX: if the prompt is stale (client went silent for a while and this is
+        # actually a new, unrelated message), clear the flag and fall through to
+        # normal handling below instead of misfiling it as the check-in note
+        started_raw = context.user_data.get("awaiting_checkin_note_started_at")
+        is_stale = True
+        if started_raw:
+            try:
+                started = datetime.fromisoformat(started_raw)
+                is_stale = (datetime.now(timezone.utc) - started) > timedelta(minutes=30)
+            except Exception:
+                is_stale = True
 
-        try:
-            today_start = get_today_start_utc()  # FIX: EAT-correct boundary
-            if supabase.table("daily_logs").select("id").eq("client_id", u.id).gte("created_at", today_start).execute().data:
-                await update.message.reply_text("✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nCome back tomorrow to keep your streak going.", parse_mode="HTML")
-                return
+        if is_stale:
+            context.user_data["awaiting_checkin_note"] = False
+            context.user_data.pop("awaiting_checkin_note_started_at", None)
+            context.user_data.pop("checkin_nut", None)
+            context.user_data.pop("checkin_second", None)
+            # no return — falls through to the normal media/Q&A handling below
+        else:
+            context.user_data["awaiting_checkin_note"] = False
+            context.user_data.pop("awaiting_checkin_note_started_at", None)
+            note = update.message.text.strip() if update.message.text else "No note"
+            nut = context.user_data.pop("checkin_nut", "Logged")
+            second = context.user_data.pop("checkin_second", "Logged")
 
-            supabase.table("daily_logs").insert({
-                "client_id": u.id,
-                "nutrition_status": nut,
-                "hydration_status": second,
-                "message_text": note
-            }).execute()
-            
-            logs = supabase.table("daily_logs").select("created_at").eq("client_id", u.id).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data
-            streak = len({parse_supabase_timestamp(l["created_at"]).date() for l in logs})
-            celeb = f"\n\n🔥 <b>ድንቅ ክንውን! / MILESTONE UNLOCKED!</b> የ <b>{streak} ቀን</b> የክትትል Streak አስመዝግበዋል!" if streak in [7,14,30] else ""
-            
-            await update.message.reply_text(
-                f"🎉 <b>ክትትልዎ እና ማስታወሻዎ ተመዝግበዋል! / Check-In Completed!</b>\n"
-                f"ማስታወሻ፦ <i>{esc(note)}</i>\n"
-                f"ሳይመን progressዎን በቅርቡ ይገመግማል{celeb}",
-                parse_mode="HTML"
-            )
+            try:
+                today_start = get_today_start_utc()  # FIX: EAT-correct boundary
+                if supabase.table("daily_logs").select("id").eq("client_id", u.id).gte("created_at", today_start).execute().data:
+                    await update.message.reply_text("✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nCome back tomorrow to keep your streak going.", parse_mode="HTML")
+                    return
 
-            # Route check-in note to admin chat
-            for a_id in ADMIN_USER_IDS:
-                await send_message_safely(
-                    context, chat_id=a_id,
-                    text=f"📊 <b>DAILY CHECK-IN NOTE: {esc(u.full_name)}</b>\n• Nutrition: {nut}\n• Recovery/Hydration: {second}\n• Note: <i>{esc(note)}</i>",
+                supabase.table("daily_logs").insert({
+                    "client_id": u.id,
+                    "nutrition_status": nut,
+                    "hydration_status": second,
+                    "message_text": note
+                }).execute()
+                
+                logs = supabase.table("daily_logs").select("created_at").eq("client_id", u.id).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data
+                streak = len({parse_supabase_timestamp(l["created_at"]).date() for l in logs})
+                celeb = f"\n\n🔥 <b>ድንቅ ክንውን! / MILESTONE UNLOCKED!</b> የ <b>{streak} ቀን</b> የክትትል Streak አስመዝግበዋል!" if streak in [7,14,30] else ""
+                
+                await update.message.reply_text(
+                    f"🎉 <b>ክትትልዎ እና ማስታወሻዎ ተመዝግበዋል! / Check-In Completed!</b>\n"
+                    f"ማስታወሻ፦ <i>{esc(note)}</i>\n"
+                    f"ሳይመን progressዎን በቅርቡ ይገመግማል{celeb}",
                     parse_mode="HTML"
                 )
-        except Exception:
-            await update.message.reply_text("🎉 <b>ክትትልዎ ተመዝግቧል! / Check-In Completed!</b>\nሳይመን progressዎን በቅርቡ ይገመግማል.", parse_mode="HTML")
-        return
+
+                # Route check-in note to admin chat
+                for a_id in ADMIN_USER_IDS:
+                    await send_message_safely(
+                        context, chat_id=a_id,
+                        text=f"📊 <b>DAILY CHECK-IN NOTE: {esc(u.full_name)}</b>\n• Nutrition: {nut}\n• Recovery/Hydration: {second}\n• Note: <i>{esc(note)}</i>",
+                        parse_mode="HTML"
+                    )
+            except Exception:
+                await update.message.reply_text("🎉 <b>ክትትልዎ ተመዝግቧል! / Check-In Completed!</b>\nሳይመን progressዎን በቅርቡ ይገመግማል.", parse_mode="HTML")
+            return
 
     try:
         c = supabase.table("clients").select("package, full_name").eq("id", u.id).execute().data[0]
