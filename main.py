@@ -1,6 +1,7 @@
 import os
 import logging
-from datetime import datetime, timedelta
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -28,6 +29,11 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 ADMIN_USER_IDS = [1622298145, 389487101]
+
+# Fail fast on startup instead of crashing deep inside create_client/ApplicationBuilder
+for _name, _val in [("BOT_TOKEN", BOT_TOKEN), ("SUPABASE_URL", SUPABASE_URL), ("SUPABASE_KEY", SUPABASE_KEY)]:
+    if not _val:
+        raise RuntimeError(f"Missing required environment variable: {_name}")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -73,6 +79,17 @@ async def get_client_language(user_id: int) -> str:
     return "am"  # Default to Amharic/English dual display
 
 # ------------------------------------------------------------------
+# HELPER: PARSE SUPABASE TIMESTAMPS AS TIMEZONE-AWARE UTC
+# ------------------------------------------------------------------
+def parse_supabase_timestamp(ts: str) -> datetime:
+    """Parses a Supabase/Postgres ISO timestamp into a tz-aware UTC datetime."""
+    normalized = ts.replace("Z", "+00:00")
+    dt = datetime.fromisoformat(normalized)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+# ------------------------------------------------------------------
 # ELITE BACKGROUND JOBS (Sunday Reports, Streaks, Expirations)
 # ------------------------------------------------------------------
 async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
@@ -81,21 +98,34 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
         if not res.data:
             return
 
+        clients = [c for c in res.data if c.get("package", "Meal Plan Only") != "Meal Plan Only"]
+        if not clients:
+            return
+
+        # Fetch all relevant logs in one query instead of one query per client (avoids N+1)
+        seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        client_ids = [c["id"] for c in clients]
+        logs_res = (
+            supabase.table("daily_logs")
+            .select("client_id, created_at")
+            .in_("client_id", client_ids)
+            .gte("created_at", seven_days_ago)
+            .execute()
+        )
+        logs_by_client = defaultdict(set)
+        for log in (logs_res.data or []):
+            log_date = parse_supabase_timestamp(log["created_at"]).date()
+            logs_by_client[log["client_id"]].add(log_date)
+
         report_lines = ["📥 <b>WEEKLY REVIEW QUEUE FOR COACH SIMON</b>\n"]
-        
-        for client in res.data:
+
+        for client in clients:
             c_id = client["id"]
             name = client.get("full_name", "Client")
             tier = client.get("package", "Meal Plan Only")
             goal = client.get("goal", "goal_fat_loss")
 
-            if tier == "Meal Plan Only":
-                continue
-
-            seven_days_ago = (datetime.now() - timedelta(days=7)).isoformat()
-            logs_res = supabase.table("daily_logs").select("*").eq("client_id", c_id).gte("created_at", seven_days_ago).execute()
-            logs = logs_res.data if logs_res.data else []
-            streak = len(logs)
+            streak = len(logs_by_client.get(c_id, set()))
 
             goal_icon = "💪" if goal == "goal_muscle" else "🔥"
             report_lines.append(f"{goal_icon} <b>{name}</b> ({tier})\n• Adherence: {streak} / 7 Days Logged\n")
@@ -104,35 +134,48 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
         for admin_id in ADMIN_USER_IDS:
             try:
                 await context.bot.send_message(chat_id=admin_id, text=full_report, parse_mode="HTML")
-            except Exception:
-                pass
+            except Exception as send_err:
+                logging.error(f"Failed to send Sunday report to admin {admin_id}: {send_err}")
     except Exception as e:
         logging.error(f"Error generating Sunday report: {e}")
 
 async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
     try:
-        res = supabase.table("clients").select("id, full_name, package, created_at").execute()
+        res = supabase.table("clients").select("id, full_name, package, created_at, renewal_notified").execute()
         if not res.data:
             return
 
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         for client in res.data:
             c_id = client["id"]
             tier = client.get("package", "Meal Plan Only")
             if tier == "Meal Plan Only":
                 continue
 
-            created_date = datetime.fromisoformat(client["created_at"].replace("Z", "+00:00").split("+")[0])
+            if client.get("renewal_notified"):
+                continue
+
+            created_date = parse_supabase_timestamp(client["created_at"])
             days_active = (now - created_date).days
 
-            if days_active == 57:
-                await context.bot.send_message(
-                    chat_id=c_id,
-                    text="⚠️ <b>የኮቺንግ ፓኬጅዎ በ3 ቀናት ውስጥ ይጠናቀቃል! / Package Expires in 3 Days!</b>\n"
-                         "እቅዶችዎን እና ክትትልዎን መቀጠል እንዲችሉ ከታች በመጫን ያድሱ:",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 ፓኬጅ ማደሻ / Renew Package", callback_data="upgrade_tier")]]),
-                    parse_mode="HTML"
-                )
+            # Use >= instead of == so a missed scheduler run (downtime/deploy) doesn't
+            # silently skip the client forever. The renewal_notified flag prevents repeats.
+            if days_active >= 57:
+                try:
+                    await context.bot.send_message(
+                        chat_id=c_id,
+                        text="⚠️ <b>የኮቺንግ ፓኬጅዎ በ3 ቀናት ውስጥ ይጠናቀቃል! / Package Expires in 3 Days!</b>\n"
+                             "እቅዶችዎን እና ክትትልዎን መቀጠል እንዲችሉ ከታች በመጫን ያድሱ:",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 ፓኬጅ ማደሻ / Renew Package", callback_data="upgrade_tier")]]),
+                        parse_mode="HTML"
+                    )
+                    try:
+                        supabase.table("clients").update({"renewal_notified": True}).eq("id", c_id).execute()
+                    except Exception as db_err:
+                        # If the column doesn't exist yet, log it so it's visible instead of failing silently
+                        logging.error(f"Could not set renewal_notified for client {c_id} (column may be missing): {db_err}")
+                except Exception as send_err:
+                    logging.error(f"Failed to send expiration notice to client {c_id}: {send_err}")
     except Exception as e:
         logging.error(f"Error checking expirations: {e}")
 
@@ -150,12 +193,17 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     target_client_id = context.args[0]
     plan_type = context.args[1].lower()
+
+    if plan_type not in ("meal", "workout"):
+        await update.message.reply_text("⚠️ Invalid plan type. Use `meal` or `workout` (e.g. `/sendplan 12345 meal`).")
+        return
+
     file_id = update.message.document.file_id
     col_name = "meal_plan_url" if plan_type == "meal" else "workout_plan_url"
 
     try:
         supabase.table("clients").update({col_name: file_id}).eq("id", target_client_id).execute()
-        
+
         await context.bot.send_message(
             chat_id=target_client_id,
             text=f"🎉 <b>አዲስ የ{plan_type.capitalize()} እቅድ ተጭኗል! / New Plan Updated!</b>\nኮች ሲሞን አዲስ እቅድዎን ልኮልዎታል። ለማየት ዋናውን ምናሌ ይክፈቱ!",
@@ -224,12 +272,13 @@ async def handle_language_switch(update: Update, context: ContextTypes.DEFAULT_T
 
     try:
         supabase.table("clients").update({"language": new_lang}).eq("id", user_id).execute()
-    except Exception:
-        pass  # Fallback if column doesn't exist yet, stored in user session
+    except Exception as db_err:
+        # Log instead of silently swallowing - otherwise the UI confirms a switch that never happened
+        logging.error(f"Failed to persist language preference for user {user_id}: {db_err}")
 
     reply_markup = await get_main_menu_markup(user_id)
     confirmation_text = "Language switched to English! 🇬🇧" if new_lang == "en" else "ቋንቋ ወደ አማርኛ ተቀይሯል! 🇪🇹"
-    
+
     await query.message.edit_text(
         f"✅ <b>{confirmation_text}</b>\n\nእንኳን ወደ ሲሞን ኦሪጅን ፖርታል በደህና መጡ! ከታች ይምረጡ:",
         reply_markup=reply_markup,
@@ -251,15 +300,35 @@ async def handle_target_plan(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         client = res.data[0]
         tier = client.get("package", "Meal Plan Only")
-        meal_url = client.get("meal_plan_url", "Not Uploaded Yet")
-        workout_url = client.get("workout_plan_url", "Not Uploaded Yet")
+        meal_file_id = client.get("meal_plan_url")
+        workout_file_id = client.get("workout_plan_url")
 
-        if tier == "Meal Plan Only":
-            text = f"📋 <b>NUTRITION BLUEPRINT / የምግብ እቅድ</b>\n\n🔗 <b>Meal Plan:</b> {meal_url}"
+        header = "📋 <b>NUTRITION BLUEPRINT / የምግብ እቅድ</b>" if tier == "Meal Plan Only" else "📋 <b>FULL COACHING BLUEPRINT / የኮቺንግ እቅድ</b>"
+        await query.message.reply_text(header, parse_mode="HTML")
+
+        # meal_plan_url / workout_plan_url actually store Telegram file_ids, not links,
+        # so they need to be sent as documents rather than printed as text.
+        if meal_file_id:
+            try:
+                await context.bot.send_document(chat_id=user_id, document=meal_file_id, caption="🔗 Meal Plan")
+            except Exception as send_err:
+                logging.error(f"Failed to send meal plan document to {user_id}: {send_err}")
+                await query.message.reply_text("⚠️ Could not send your meal plan file. Please contact Coach Simon.")
         else:
-            text = f"📋 <b>FULL COACHING BLUEPRINT / የኮቺንግ እቅድ</b>\n\n🔗 <b>Meal Plan:</b> {meal_url}\n🏋️ <b>Workout Plan:</b> {workout_url}"
+            msg = "🔗 Meal Plan: Not Uploaded Yet" if lang == "en" else "🔗 የምግብ እቅድ፦ እስካሁን አልተጫነም"
+            await query.message.reply_text(msg)
 
-        await query.message.reply_text(text, parse_mode="HTML")
+        if tier != "Meal Plan Only":
+            if workout_file_id:
+                try:
+                    await context.bot.send_document(chat_id=user_id, document=workout_file_id, caption="🏋️ Workout Plan")
+                except Exception as send_err:
+                    logging.error(f"Failed to send workout plan document to {user_id}: {send_err}")
+                    await query.message.reply_text("⚠️ Could not send your workout plan file. Please contact Coach Simon.")
+            else:
+                msg = "🏋️ Workout Plan: Not Uploaded Yet" if lang == "en" else "🏋️ የአካል ብቃት እቅድ፦ እስካሁን አልተጫነም"
+                await query.message.reply_text(msg)
+
     except Exception as e:
         logging.error(f"Error fetching target plan: {e}")
         await query.message.reply_text("⚠️ Database error fetching your plan.")
@@ -370,8 +439,18 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
                 "hydration_status": second_status
             }).execute()
 
-            logs_res = supabase.table("daily_logs").select("*").eq("client_id", user_id).execute()
-            streak_count = len(logs_res.data) if logs_res.data else 1
+            # Streak = distinct days logged within the last 7 days (matches Sunday report logic),
+            # not a raw count of every check-in row ever inserted.
+            seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            logs_res = (
+                supabase.table("daily_logs")
+                .select("created_at")
+                .eq("client_id", user_id)
+                .gte("created_at", seven_days_ago)
+                .execute()
+            )
+            logged_dates = {parse_supabase_timestamp(l["created_at"]).date() for l in (logs_res.data or [])}
+            streak_count = len(logged_dates) if logged_dates else 1
 
             celebration = ""
             if streak_count in [7, 14, 30]:
@@ -381,6 +460,8 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
         except Exception as e:
             logging.error(f"Failed to record check-in: {e}")
             await query.message.reply_text("🎉 <b>Check-In Completed!</b> Coach Simon will review your progress soon.", parse_mode="HTML")
+        finally:
+            context.user_data.pop("checkin_nut", None)
 
 # ------------------------------------------------------------------
 # CRASH-PROOF MEDIA & TEXT HANDLER
@@ -424,14 +505,14 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
                 logging.error(f"Database error saving media: {db_err}")
 
             await update.message.reply_text("Got it! 🎥 Your attachment has been saved for Coach Simon's review.", parse_mode="HTML")
-            
+
             if update.message.photo and tier == "Meal Plan Only":
                  vip_alert = f"🚨 <b>UPGRADE RECEIPT / የክፍያ ደረሰኝ!</b>\nClient: {user.full_name} ({user.id})"
                  for admin_id in ADMIN_USER_IDS:
                      try:
                          await context.bot.send_photo(chat_id=admin_id, photo=file_id, caption=vip_alert, parse_mode="HTML")
-                     except Exception:
-                         pass
+                     except Exception as send_err:
+                         logging.error(f"Failed to send receipt alert to admin {admin_id}: {send_err}")
             return
 
         if update.message.text:
@@ -458,8 +539,8 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
                 for admin_id in ADMIN_USER_IDS:
                     try:
                         await context.bot.send_message(chat_id=admin_id, text=vip_alert, parse_mode="HTML")
-                    except Exception:
-                        pass
+                    except Exception as send_err:
+                        logging.error(f"Failed to send VIP alert to admin {admin_id}: {send_err}")
                 await update.message.reply_text("Your VIP message has been routed directly to Coach Simon!")
             else:
                 await update.message.reply_text("Question saved! 📝 Coach Simon will address this in your next check-in.", parse_mode="HTML")
@@ -477,7 +558,7 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
 # ------------------------------------------------------------------
 async def post_init(application):
     await start_web_server()
-    
+
     scheduler = AsyncIOScheduler()
     scheduler.add_job(send_sunday_admin_report, "cron", day_of_week="sun", hour=8, minute=0, args=[application])
     scheduler.add_job(check_expirations_and_streaks, "cron", hour=9, minute=0, args=[application])
@@ -489,23 +570,23 @@ def main():
 
     # Base Commands
     app.add_handler(CommandHandler("start", start_command))
-    
+
     # Admin Commands
     app.add_handler(CommandHandler("sendplan", admin_send_plan))
     app.add_handler(CommandHandler("reply", admin_send_voice_feedback))
-    
+
     # Button Callbacks
     app.add_handler(CallbackQueryHandler(handle_target_plan, pattern="^get_target_plan$"))
     app.add_handler(CallbackQueryHandler(trigger_daily_checkin, pattern="^start_checkin$"))
     app.add_handler(CallbackQueryHandler(handle_checkin_responses, pattern="^log_"))
-    
+
     # Language Switch Callbacks
     app.add_handler(CallbackQueryHandler(handle_language_switch, pattern="^set_lang_"))
 
     # Upgrade Callbacks
     app.add_handler(CallbackQueryHandler(handle_upgrade_button, pattern="^upgrade_tier$"))
     app.add_handler(CallbackQueryHandler(handle_upgrade_payment_info, pattern="^upgrade_60day$|^upgrade_90day$"))
-    
+
     # Media & Text Handlers
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_client_attachments))
 
