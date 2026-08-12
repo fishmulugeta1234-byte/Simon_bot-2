@@ -89,6 +89,16 @@ def parse_supabase_timestamp(ts: str) -> datetime:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
+# FIX: single source of truth for "start of today" in EAT, converted to UTC for
+# comparison against Supabase's UTC timestamps. Previously every call site computed
+# this from datetime.now(timezone.utc).replace(hour=0,...), which is UTC midnight,
+# not EAT midnight (EAT is UTC+3) -- causing checkins between 00:00-03:00 EAT to be
+# attributed to the wrong day.
+def get_today_start_utc() -> str:
+    now_eat = datetime.now(EAT_TIMEZONE)
+    start_eat = now_eat.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_eat.astimezone(timezone.utc).isoformat()
+
 async def send_message_safely(context: ContextTypes.DEFAULT_TYPE, chat_id: int, **kwargs) -> bool:
     try:
         await context.bot.send_message(chat_id=chat_id, **kwargs)
@@ -135,7 +145,7 @@ async def send_daily_checkin_reminders(context: ContextTypes.DEFAULT_TYPE):
             return
 
         clients = [c for c in res.data if "Meal Plan Only" not in c.get("package", "")]
-        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        today_start = get_today_start_utc()  # FIX: EAT-correct boundary
         
         logs_res = supabase.table("daily_logs").select("client_id").in_("client_id", [c["id"] for c in clients]).gte("created_at", today_start).execute()
         already_checked_in = {log["client_id"] for log in (logs_res.data or [])}
@@ -163,7 +173,7 @@ async def send_late_night_reminders(context: ContextTypes.DEFAULT_TYPE):
             return
 
         clients = [c for c in res.data if "Meal Plan Only" not in c.get("package", "")]
-        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        today_start = get_today_start_utc()  # FIX: EAT-correct boundary
         
         logs_res = supabase.table("daily_logs").select("client_id").in_("client_id", [c["id"] for c in clients]).gte("created_at", today_start).execute()
         already_checked_in = {log["client_id"] for log in (logs_res.data or [])}
@@ -260,7 +270,12 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Usage: `/broadcast <message>`", parse_mode="HTML")
         return
 
-    text = "📢 <b>ANNOUNCEMENT FROM ሳይመን / ማስታወቂያ</b>\n\n" + " ".join(context.args)
+    # FIX: context.args is whitespace-tokenized, which collapses newlines the admin
+    # typed. Pull the raw text after the command instead, so formatting/line breaks survive.
+    raw_text = update.message.text.split(maxsplit=1)
+    body = raw_text[1] if len(raw_text) > 1 else ""
+    text = "📢 <b>ANNOUNCEMENT FROM ሳይመን / ማስታወቂያ</b>\n\n" + body
+
     res = supabase.table("clients").select("id").eq("is_active", True).execute()
     count = 0
     msg = await update.message.reply_text(f"🚀 Broadcasting to {len(res.data or [])} clients...")
@@ -316,12 +331,23 @@ async def admin_client_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error: {e}")
 
+# FIX: admin_send_plan now
+#   1) accepts a document attached to the command message OR the message being replied to
+#   2) validates p_type instead of silently defaulting unknown values to "workout"
 async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_USER_IDS: 
+    if update.effective_user.id not in ADMIN_USER_IDS:
         return
-        
-    if len(context.args) < 2 or not update.message.document:
-        await update.message.reply_text("⚠️ Usage: Reply to a document with `/sendplan <client_id> <meal|workout>`", parse_mode="HTML")
+
+    doc = update.message.document or (
+        update.message.reply_to_message.document if update.message.reply_to_message else None
+    )
+
+    if len(context.args) < 2 or not doc:
+        await update.message.reply_text(
+            "⚠️ Usage: Send the file first (no caption), then reply to it with "
+            "`/sendplan <client_id> <meal|workout>`",
+            parse_mode="HTML"
+        )
         return
 
     try:
@@ -331,8 +357,12 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Error: Client ID must be a valid number.")
         return
 
+    if p_type not in ("meal", "workout"):
+        await update.message.reply_text("❌ Error: plan type must be `meal` or `workout`.", parse_mode="HTML")
+        return
+
     col = "meal_plan_url" if p_type == "meal" else "workout_plan_url"
-    file_id = update.message.document.file_id
+    file_id = doc.file_id
     
     try:
         supabase.table("clients").update({
@@ -393,12 +423,20 @@ async def admin_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS: 
         return
     
-    if not context.args or not update.message.document:
-        await update.message.reply_text("⚠️ Usage: Attach a document and type `/sendfile <client_id>`", parse_mode="HTML")
+    # FIX: same reply-fallback as admin_send_plan, for consistency
+    doc = update.message.document or (
+        update.message.reply_to_message.document if update.message.reply_to_message else None
+    )
+
+    if not context.args or not doc:
+        await update.message.reply_text(
+            "⚠️ Usage: Send the file first (no caption), then reply to it with `/sendfile <client_id>`",
+            parse_mode="HTML"
+        )
         return
 
     c_id = context.args[0]
-    file_id = update.message.document.file_id
+    file_id = doc.file_id
     caption = update.message.caption or "📁 <b>ከሳይመን የተላከ ተጨማሪ ሰነድ / Additional Document from Coach</b>"
     
     success = await send_message_safely(
@@ -552,7 +590,11 @@ async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     u_id = query.from_user.id
-    
+
+    # FIX: entering the upgrade flow fresh means any old pending state is stale — clear it
+    context.user_data.pop("pending_tier", None)
+    context.user_data["awaiting_payment_screenshot"] = False
+
     loc_type = "et"
     try:
         res = supabase.table("clients").select("location_type").eq("id", u_id).execute()
@@ -613,6 +655,9 @@ async def handle_upgrade_payment_info(update: Update, context: ContextTypes.DEFA
     }
     sel = tier_map.get(query.data, "Transformation (60 Days)")
     context.user_data["pending_tier"] = sel
+    # FIX: explicit flag so the next photo this user sends is unambiguously a payment
+    # receipt, instead of inferring that from "a photo arrived" (see handle_client_attachments)
+    context.user_data["awaiting_payment_screenshot"] = True
 
     if loc_type == "et":
         text = (
@@ -641,7 +686,7 @@ async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TY
     u_id = query.from_user.id
 
     try:
-        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        today_start = get_today_start_utc()  # FIX: EAT-correct boundary
         if supabase.table("daily_logs").select("id").eq("client_id", u_id).gte("created_at", today_start).execute().data:
             await query.message.reply_text("✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nአስደናቂ ወጥነት! Streak እንዳይቋረጥ ነገ ይመለሱ! 🔥", parse_mode="HTML")
             return
@@ -671,7 +716,15 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
     
     if query.data in ["log_nut_hit", "log_nut_miss"]:
         context.user_data["checkin_nut"] = "Hit" if query.data == "log_nut_hit" else "Missed"
-        goal = supabase.table("clients").select("goal").eq("id", u_id).execute().data[0].get("goal", "goal_fat_loss")
+
+        # FIX: guard against a missing/empty client row instead of indexing .data[0] blindly
+        try:
+            res = supabase.table("clients").select("goal").eq("id", u_id).execute()
+            goal = res.data[0].get("goal", "goal_fat_loss") if res.data else "goal_fat_loss"
+        except Exception as e:
+            logging.error(f"Error fetching goal for {u_id} in checkin flow: {e}")
+            goal = "goal_fat_loss"
+
         if goal == "goal_muscle":
             kb = [[InlineKeyboardButton("💤 7+ ሰዓት ተኝቻለሁ", callback_data="log_second_hit")], [InlineKeyboardButton("❌ በቂ እረፍት አላገኘሁም", callback_data="log_second_miss")]]
             text = "💤 <b>የእረፍት ክትትል / RECOVERY CHECK</b>\nበቂ (7+ ሰዓት) እረፍት አድርገዋል? / Did you hit your sleep target?"
@@ -706,7 +759,7 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
         second = context.user_data.pop("checkin_second", "Logged")
 
         try:
-            today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            today_start = get_today_start_utc()  # FIX: EAT-correct boundary
             if supabase.table("daily_logs").select("id").eq("client_id", u.id).gte("created_at", today_start).execute().data:
                 await update.message.reply_text("✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nCome back tomorrow to keep your streak going.", parse_mode="HTML")
                 return
@@ -760,7 +813,11 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
 
         await update.message.reply_text("Got it! 🎥 Your attachment has been saved for ሳይመን's review.", parse_mode="HTML")
 
-        if update.message.photo:
+        # FIX: only treat this photo as a payment receipt if the user was actually sent
+        # to the payment-instructions screen. Previously ANY photo (form checks, progress
+        # pics) triggered the "PAYMENT RECEIPT! Approve tier" admin alert.
+        if update.message.photo and context.user_data.get("awaiting_payment_screenshot"):
+            context.user_data["awaiting_payment_screenshot"] = False
             req_tier = context.user_data.get("pending_tier", "Transformation (60 Days)")
             txt = f"🚨 <b>PAYMENT RECEIPT!</b>\nClient: {u.full_name} (<code>{u.id}</code>)\nTier: {req_tier}"
             kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Approve & Set {req_tier}", callback_data=f"approve_tier_{u.id}_{req_tier[:3]}")]])
