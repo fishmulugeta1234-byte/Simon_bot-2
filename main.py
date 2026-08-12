@@ -1,10 +1,12 @@
 import os
 import logging
+import asyncio
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Forbidden
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -94,11 +96,34 @@ def parse_supabase_timestamp(ts: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 # ------------------------------------------------------------------
+# HELPER: SAFE MESSAGE SENDER (Detects Blocked Bots)
+# ------------------------------------------------------------------
+async def send_message_safely(context: ContextTypes.DEFAULT_TYPE, chat_id: int, **kwargs) -> bool:
+    """
+    Sends a message safely. If the user blocked the bot (Forbidden),
+    flags them as is_active = False in Supabase so jobs skip them.
+    """
+    try:
+        await context.bot.send_message(chat_id=chat_id, **kwargs)
+        return True
+    except Forbidden:
+        logging.warning(f"🚫 Client {chat_id} blocked the bot. Marking as inactive.")
+        try:
+            supabase.table("clients").update({"is_active": False}).eq("id", chat_id).execute()
+        except Exception as db_err:
+            logging.error(f"Failed to set is_active=False for client {chat_id}: {db_err}")
+        return False
+    except Exception as err:
+        logging.error(f"Failed to send message to client {chat_id}: {err}")
+        return False
+
+# ------------------------------------------------------------------
 # ELITE BACKGROUND JOBS (Sunday Reports, Streaks, Expirations)
 # ------------------------------------------------------------------
 async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
     try:
-        res = supabase.table("clients").select("id, full_name, package, goal").execute()
+        # Filter for active clients
+        res = supabase.table("clients").select("id, full_name, package, goal").eq("is_active", True).execute()
         if not res.data:
             return
 
@@ -106,7 +131,7 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
         if not clients:
             return
 
-        # Fetch all relevant logs in one query instead of one query per client (avoids N+1)
+        # Fetch all relevant logs in one query
         seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
         client_ids = [c["id"] for c in clients]
         logs_res = (
@@ -130,22 +155,21 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
             goal = client.get("goal", "goal_fat_loss")
 
             streak = len(logs_by_client.get(c_id, set()))
-
             goal_icon = "💪" if goal == "goal_muscle" else "🔥"
             report_lines.append(f"{goal_icon} <b>{name}</b> ({tier})\n• Adherence: {streak} / 7 Days Logged\n")
 
         full_report = "\n".join(report_lines)
         for admin_id in ADMIN_USER_IDS:
-            try:
-                await context.bot.send_message(chat_id=admin_id, text=full_report, parse_mode="HTML")
-            except Exception as send_err:
-                logging.error(f"Failed to send Sunday report to admin {admin_id}: {send_err}")
+            await send_message_safely(context, chat_id=admin_id, text=full_report, parse_mode="HTML")
+            await asyncio.sleep(0.05)  # Rate limiting safety delay
+            
     except Exception as e:
         logging.error(f"Error generating Sunday report: {e}")
 
 async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
     try:
-        res = supabase.table("clients").select("id, full_name, package, created_at, renewal_notified").execute()
+        # Filter for active clients
+        res = supabase.table("clients").select("id, full_name, package, created_at, renewal_notified").eq("is_active", True).execute()
         if not res.data:
             return
 
@@ -162,31 +186,30 @@ async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
             created_date = parse_supabase_timestamp(client["created_at"])
             days_active = (now - created_date).days
 
-            # Use >= instead of == so a missed scheduler run (downtime/deploy) doesn't
-            # silently skip the client forever. The renewal_notified flag prevents repeats.
             if days_active >= 57:
-                try:
-                    await context.bot.send_message(
-                        chat_id=c_id,
-                        text="⚠️ <b>የኮቺንግ ፓኬጅዎ በ3 ቀናት ውስጥ ይጠናቀቃል! / Package Expires in 3 Days!</b>\n"
-                             "እቅዶችዎን እና ክትትልዎን መቀጠል እንዲችሉ ከታች በመጫን ያድሱ:",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 ፓኬጅ ማደሻ / Renew Package", callback_data="upgrade_tier")]]),
-                        parse_mode="HTML"
-                    )
+                success = await send_message_safely(
+                    context,
+                    chat_id=c_id,
+                    text="⚠️ <b>የኮቺንግ ፓኬጅዎ በ3 ቀናት ውስጥ ይጠናቀቃል! / Package Expires in 3 Days!</b>\n"
+                         "እቅዶችዎን እና ክትትልዎን መቀጠል እንዲችሉ ከታች በመጫን ያድሱ:",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 ፓኬጅ ማደሻ / Renew Package", callback_data="upgrade_tier")]]),
+                    parse_mode="HTML"
+                )
+                if success:
                     try:
                         supabase.table("clients").update({"renewal_notified": True}).eq("id", c_id).execute()
                     except Exception as db_err:
-                        # If the column doesn't exist yet, log it so it's visible instead of failing silently
-                        logging.error(f"Could not set renewal_notified for client {c_id} (column may be missing): {db_err}")
-                except Exception as send_err:
-                    logging.error(f"Failed to send expiration notice to client {c_id}: {send_err}")
+                        logging.error(f"Could not set renewal_notified for client {c_id}: {db_err}")
+                        
+                await asyncio.sleep(0.05) # Rate limiting safety delay
+
     except Exception as e:
         logging.error(f"Error checking expirations: {e}")
 
 async def send_daily_checkin_reminders(context: ContextTypes.DEFAULT_TYPE):
-    """Nudges clients (who haven't already checked in today) to use the check-in feature."""
+    """Nudges active clients (who haven't checked in today) to log progress."""
     try:
-        res = supabase.table("clients").select("id, package, language").execute()
+        res = supabase.table("clients").select("id, package, language").eq("is_active", True).execute()
         if not res.data:
             return
 
@@ -194,7 +217,6 @@ async def send_daily_checkin_reminders(context: ContextTypes.DEFAULT_TYPE):
         if not clients:
             return
 
-        # Find who has already checked in today, so we don't nag people who already did it
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         client_ids = [c["id"] for c in clients]
         logs_res = (
@@ -217,21 +239,69 @@ async def send_daily_checkin_reminders(context: ContextTypes.DEFAULT_TYPE):
             else:
                 text = "🔔 <b>የዕለት ክትትልዎን አይርሱ! / Don't forget your daily check-in!</b>\nዛሬ ያደረጉትን ለመመዝገብ ከታች ይጫኑ:"
 
-            try:
-                await context.bot.send_message(
-                    chat_id=c_id,
-                    text=text,
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Check In Now", callback_data="start_checkin")]]),
-                    parse_mode="HTML"
-                )
-            except Exception as send_err:
-                logging.error(f"Failed to send check-in reminder to client {c_id}: {send_err}")
+            await send_message_safely(
+                context,
+                chat_id=c_id,
+                text=text,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Check In Now", callback_data="start_checkin")]]),
+                parse_mode="HTML"
+            )
+            await asyncio.sleep(0.05) # Rate limiting safety delay
+
     except Exception as e:
         logging.error(f"Error sending daily check-in reminders: {e}")
 
 # ------------------------------------------------------------------
-# ADMIN FILE & VOICE NOTE DELIVERY HANDLERS
+# ADMIN COMMANDS (Deliverables & Info)
 # ------------------------------------------------------------------
+async def admin_client_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Instantly lookup a client's stats in Supabase."""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: `/clientinfo <client_id>`")
+        return
+
+    target_id = context.args[0]
+    try:
+        res = supabase.table("clients").select("*").eq("id", target_id).execute()
+        if not res.data:
+            await update.message.reply_text("❌ Client not found in database.")
+            return
+
+        c = res.data[0]
+        created_dt = parse_supabase_timestamp(c["created_at"])
+        days_active = (datetime.now(timezone.utc) - created_dt).days
+
+        seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        logs_res = (
+            supabase.table("daily_logs")
+            .select("created_at")
+            .eq("client_id", target_id)
+            .gte("created_at", seven_days_ago)
+            .execute()
+        )
+        checkin_count = len(logs_res.data) if logs_res.data else 0
+
+        info_text = (
+            f"👤 <b>CLIENT INFO: {c.get('full_name', 'N/A')}</b>\n"
+            f"• <b>ID:</b> <code>{c['id']}</code>\n"
+            f"• <b>Package:</b> {c.get('package', 'N/A')}\n"
+            f"• <b>Goal:</b> {c.get('goal', 'N/A')}\n"
+            f"• <b>Language:</b> {c.get('language', 'am')}\n"
+            f"• <b>Active Days:</b> {days_active} days\n"
+            f"• <b>7-Day Check-ins:</b> {checkin_count} / 7\n"
+            f"• <b>Status:</b> {'🟢 Active' if c.get('is_active', True) else '🔴 Inactive (Blocked)'}\n"
+            f"• <b>Meal Plan:</b> {'Yes ✅' if c.get('meal_plan_url') else 'No ❌'}\n"
+            f"• <b>Workout Plan:</b> {'Yes ✅' if c.get('workout_plan_url') else 'No ❌'}"
+        )
+        await update.message.reply_text(info_text, parse_mode="HTML")
+
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error fetching client info: {e}")
+
 async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
@@ -254,7 +324,8 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         supabase.table("clients").update({col_name: file_id}).eq("id", target_client_id).execute()
 
-        await context.bot.send_message(
+        await send_message_safely(
+            context,
             chat_id=target_client_id,
             text=f"🎉 <b>አዲስ የ{plan_type.capitalize()} እቅድ ተጭኗል! / New Plan Updated!</b>\nኮች ሲሞን አዲስ እቅድዎን ልኮልዎታል። ለማየት ዋናውን ምናሌ ይክፈቱ!",
             parse_mode="HTML"
@@ -264,9 +335,6 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Failed to update plan: {e}")
 
 async def admin_send_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends any ad-hoc file (welcome PDFs, guides, resources) directly to a client.
-    Unlike /sendplan, this does NOT touch meal_plan_url/workout_plan_url in Supabase -
-    it's a one-off delivery, not a saved plan."""
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
         return
@@ -289,6 +357,8 @@ async def admin_send_document(update: Update, context: ContextTypes.DEFAULT_TYPE
             caption=custom_message,
         )
         await update.message.reply_text("✅ File delivered to client!")
+    except Forbidden:
+         await update.message.reply_text("❌ Client has blocked the bot.")
     except Exception as e:
         await update.message.reply_text(f"⚠️ Failed to deliver file: {e}")
 
@@ -312,6 +382,8 @@ async def admin_send_voice_feedback(update: Update, context: ContextTypes.DEFAUL
             parse_mode="HTML"
         )
         await update.message.reply_text("✅ Voice note delivered to client!")
+    except Forbidden:
+         await update.message.reply_text("❌ Client has blocked the bot.")
     except Exception as e:
         await update.message.reply_text(f"⚠️ Failed to deliver voice note: {e}")
 
@@ -352,7 +424,6 @@ async def handle_language_switch(update: Update, context: ContextTypes.DEFAULT_T
     try:
         supabase.table("clients").update({"language": new_lang}).eq("id", user_id).execute()
     except Exception as db_err:
-        # Log instead of silently swallowing - otherwise the UI confirms a switch that never happened
         logging.error(f"Failed to persist language preference for user {user_id}: {db_err}")
 
     reply_markup = await get_main_menu_markup(user_id)
@@ -385,8 +456,6 @@ async def handle_target_plan(update: Update, context: ContextTypes.DEFAULT_TYPE)
         header = "📋 <b>NUTRITION BLUEPRINT / የምግብ እቅድ</b>" if tier == "Meal Plan Only" else "📋 <b>FULL COACHING BLUEPRINT / የኮቺንግ እቅድ</b>"
         await query.message.reply_text(header, parse_mode="HTML")
 
-        # meal_plan_url / workout_plan_url actually store Telegram file_ids, not links,
-        # so they need to be sent as documents rather than printed as text.
         if meal_file_id:
             try:
                 await context.bot.send_document(chat_id=user_id, document=meal_file_id, caption="🔗 Meal Plan")
@@ -456,7 +525,6 @@ async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    lang = await get_client_language(user_id)
 
     try:
         res = supabase.table("clients").select("goal").eq("id", user_id).execute()
@@ -512,7 +580,6 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
         nut_status = context.user_data.get("checkin_nut", "Logged")
 
         try:
-            # Guard against duplicate check-ins on the same day inflating the streak count
             today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
             existing_today = (
                 supabase.table("daily_logs")
@@ -535,8 +602,6 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
                 "hydration_status": second_status
             }).execute()
 
-            # Streak = distinct days logged within the last 7 days (matches Sunday report logic),
-            # not a raw count of every check-in row ever inserted.
             seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
             logs_res = (
                 supabase.table("daily_logs")
@@ -605,10 +670,7 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
             if update.message.photo and tier == "Meal Plan Only":
                  vip_alert = f"🚨 <b>UPGRADE RECEIPT / የክፍያ ደረሰኝ!</b>\nClient: {user.full_name} ({user.id})"
                  for admin_id in ADMIN_USER_IDS:
-                     try:
-                         await context.bot.send_photo(chat_id=admin_id, photo=file_id, caption=vip_alert, parse_mode="HTML")
-                     except Exception as send_err:
-                         logging.error(f"Failed to send receipt alert to admin {admin_id}: {send_err}")
+                     await send_message_safely(context, chat_id=admin_id, photo=file_id, caption=vip_alert, parse_mode="HTML")
             return
 
         if update.message.text:
@@ -633,10 +695,7 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
             if perms.get("priority"):
                 vip_alert = f"🚨 <b>INSTANT VIP QUESTION!</b>\nClient: {user.full_name}\nTier: {tier}\nMessage: {text_content}"
                 for admin_id in ADMIN_USER_IDS:
-                    try:
-                        await context.bot.send_message(chat_id=admin_id, text=vip_alert, parse_mode="HTML")
-                    except Exception as send_err:
-                        logging.error(f"Failed to send VIP alert to admin {admin_id}: {send_err}")
+                    await send_message_safely(context, chat_id=admin_id, text=vip_alert, parse_mode="HTML")
                 await update.message.reply_text("Your VIP message has been routed directly to Coach Simon!")
             else:
                 await update.message.reply_text("Question saved! 📝 Coach Simon will address this in your next check-in.", parse_mode="HTML")
@@ -669,6 +728,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
 
     # Admin Commands
+    app.add_handler(CommandHandler("clientinfo", admin_client_info))
     app.add_handler(CommandHandler("sendplan", admin_send_plan))
     app.add_handler(CommandHandler("senddoc", admin_send_document))
     app.add_handler(CommandHandler("reply", admin_send_voice_feedback))
@@ -688,7 +748,7 @@ def main():
     # Media & Text Handlers
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_client_attachments))
 
-    print("⚡ Bot #2 is live with dynamic language switching (Amharic/English)...")
+    print("⚡ Bot #2 is live with blocked-client handling and /clientinfo...")
     app.run_polling()
 
 if __name__ == "__main__":
