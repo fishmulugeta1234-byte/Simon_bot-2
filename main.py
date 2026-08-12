@@ -263,6 +263,35 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"⚠️ Failed to update plan: {e}")
 
+async def admin_send_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends any ad-hoc file (welcome PDFs, guides, resources) directly to a client.
+    Unlike /sendplan, this does NOT touch meal_plan_url/workout_plan_url in Supabase -
+    it's a one-off delivery, not a saved plan."""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        return
+
+    if not context.args or not update.message.document:
+        await update.message.reply_text(
+            "Usage: Send a file with caption `/senddoc <client_id> [optional message]`\n"
+            "e.g. `/senddoc 123456789 Welcome to the program!`"
+        )
+        return
+
+    target_client_id = context.args[0]
+    custom_message = " ".join(context.args[1:]) if len(context.args) > 1 else None
+    file_id = update.message.document.file_id
+
+    try:
+        await context.bot.send_document(
+            chat_id=target_client_id,
+            document=file_id,
+            caption=custom_message,
+        )
+        await update.message.reply_text("✅ File delivered to client!")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Failed to deliver file: {e}")
+
 async def admin_send_voice_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
@@ -641,6 +670,7 @@ def main():
 
     # Admin Commands
     app.add_handler(CommandHandler("sendplan", admin_send_plan))
+    app.add_handler(CommandHandler("senddoc", admin_send_document))
     app.add_handler(CommandHandler("reply", admin_send_voice_feedback))
 
     # Button Callbacks
