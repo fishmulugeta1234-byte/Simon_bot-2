@@ -220,7 +220,6 @@ async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
             pkg = client.get("package", "Meal Plan Only (2 Months)")
             days_active = (now - parse_supabase_timestamp(client["created_at"])).days
 
-            # Dynamic completion days based on synchronized tiers (Meal Plan Only is 60 days)
             completion_days = (
                 60 if "Meal Plan Only" in pkg else
                 (21 if "Kickstart" in pkg else 
@@ -415,7 +414,7 @@ async def get_main_menu_markup(user_id: int):
         ])
     else:
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📖 የእንድ እቅድ / My Target Plan", callback_data="get_target_plan")],
+            [InlineKeyboardButton("📖 የእኔ እቅድ / My Target Plan", callback_data="get_target_plan")],
             [InlineKeyboardButton("👤 መለያዬ / My Profile", callback_data="get_client_profile")],
             [InlineKeyboardButton("📊 የዕለት ክትትል / Daily Check-In", callback_data="start_checkin")],
             [InlineKeyboardButton("🔄 ፓኬጅ ማሻሻያ / Upgrade Package", callback_data="upgrade_tier")],
@@ -620,7 +619,7 @@ async def handle_upgrade_payment_info(update: Update, context: ContextTypes.DEFA
     await query.message.reply_text(text, parse_mode="HTML")
 
 # ------------------------------------------------------------------
-# DAILY CHECK-IN FLOW (WITH ERROR SAFETY)
+# DAILY CHECK-IN FLOW (WITH TEXT INPUT FOR CLIENTS)
 # ------------------------------------------------------------------
 async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -669,22 +668,14 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
 
     elif query.data in ["log_second_hit", "log_second_miss"]:
         second = "Hit" if query.data == "log_second_hit" else "Missed"
-        nut = context.user_data.pop("checkin_nut", "Logged")
-        
-        try:
-            today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-            if supabase.table("daily_logs").select("id").eq("client_id", u_id).gte("created_at", today_start).execute().data:
-                await query.message.reply_text("✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nCome back tomorrow to keep your streak going.", parse_mode="HTML")
-                return
+        context.user_data["checkin_second"] = second
+        context.user_data["awaiting_checkin_note"] = True
 
-            supabase.table("daily_logs").insert({"client_id": u_id, "nutrition_status": nut, "hydration_status": second}).execute()
-            
-            logs = supabase.table("daily_logs").select("created_at").eq("client_id", u_id).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data
-            streak = len({parse_supabase_timestamp(l["created_at"]).date() for l in logs})
-            celeb = f"\n\n🔥 <b>ድንቅ ክንውን! / MILESTONE UNLOCKED!</b> የ <b>{streak} ቀን</b> የክትትል Streak አስመዝግበዋል!" if streak in [7,14,30] else ""
-            await query.message.reply_text(f"🎉 <b>ክትትልዎ ተመዝግቧል! / Check-In Completed!</b>\nሳይመን progressዎን በቅርቡ ይገመግማል{celeb}", parse_mode="HTML")
-        except Exception:
-            await query.message.reply_text("🎉 <b>ክትትልዎ ተመዝግቧል! / Check-In Completed!</b>\nሳይመን progressዎን በቅርቡ ይገመግማል.", parse_mode="HTML")
+        await query.message.reply_text(
+            "✍️ <b>አጭር ማስታወሻ ወይም ጥያቄ ካለዎት ይጻፉልን (ከሌለ 'የለም' ይበሉ)፦</b>\n"
+            "<i>Drop any notes, feedback, or questions for Simon about your day:</i>",
+            parse_mode="HTML"
+        )
 
 # ------------------------------------------------------------------
 # MEDIA, Q&A, AND APPROVALS
@@ -692,6 +683,48 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
 async def handle_client_attachments(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not u or not update.message: return
+
+    # Check if client is currently in the checkin note-writing step
+    if context.user_data.get("awaiting_checkin_note"):
+        context.user_data["awaiting_checkin_note"] = False
+        note = update.message.text.strip() if update.message.text else "No note"
+        nut = context.user_data.pop("checkin_nut", "Logged")
+        second = context.user_data.pop("checkin_second", "Logged")
+
+        try:
+            today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            if supabase.table("daily_logs").select("id").eq("client_id", u.id).gte("created_at", today_start).execute().data:
+                await update.message.reply_text("✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nCome back tomorrow to keep your streak going.", parse_mode="HTML")
+                return
+
+            supabase.table("daily_logs").insert({
+                "client_id": u.id,
+                "nutrition_status": nut,
+                "hydration_status": second,
+                "message_text": note
+            }).execute()
+            
+            logs = supabase.table("daily_logs").select("created_at").eq("client_id", u.id).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data
+            streak = len({parse_supabase_timestamp(l["created_at"]).date() for l in logs})
+            celeb = f"\n\n🔥 <b>ድንቅ ክንውን! / MILESTONE UNLOCKED!</b> የ <b>{streak} ቀን</b> የክትትል Streak አስመዝግበዋል!" if streak in [7,14,30] else ""
+            
+            await update.message.reply_text(
+                f"🎉 <b>ክትትልዎ እና ማስታወሻዎ ተመዝግበዋል! / Check-In Completed!</b>\n"
+                f"ማስታወሻ፦ <i>{note}</i>\n"
+                f"ሳይመን progressዎን በቅርቡ ይገመግማል{celeb}",
+                parse_mode="HTML"
+            )
+
+            # Route check-in note to admin chat
+            for a_id in ADMIN_USER_IDS:
+                await send_message_safely(
+                    context, chat_id=a_id,
+                    text=f"📊 <b>DAILY CHECK-IN NOTE: {u.full_name}</b>\n• Nutrition: {nut}\n• Recovery/Hydration: {second}\n• Note: <i>{note}</i>",
+                    parse_mode="HTML"
+                )
+        except Exception:
+            await update.message.reply_text("🎉 <b>ክትትልዎ ተመዝግቧል! / Check-In Completed!</b>\nሳይመን progressዎን በቅርቡ ይገመግማል.", parse_mode="HTML")
+        return
 
     try:
         c = supabase.table("clients").select("package, full_name").eq("id", u.id).execute().data[0]
