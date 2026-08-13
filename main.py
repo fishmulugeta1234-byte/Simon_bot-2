@@ -55,6 +55,30 @@ TIER_PERMISSIONS = {
     "VIP Coaching (6 Months)": {"allow_media": True, "allow_qa": True, "priority": True},
 }
 
+# FIX: stable, collision-proof short codes for tier callback_data. Previously
+# tier_name[:3] was used ("Elite Transformation"[:3] == "Eli"), which silently
+# breaks the moment two tiers share a 3-letter prefix. These codes are explicit
+# and independent of tier naming, and both directions (encode/decode) are kept
+# in sync from one dict so there's a single source of truth.
+TIER_CODES = {
+    "Kickstart (21 Days)": "KS",
+    "Transformation (60 Days)": "TRF",
+    "Elite Transformation (90 Days)": "ELT",
+    "Lifestyle Coaching (6 Months)": "LSC",
+    "VIP Coaching (6 Months)": "VIP",
+}
+TIER_CODES_REVERSE = {v: k for k, v in TIER_CODES.items()}
+
+# FIX: in-process locks to serialize the "check if already logged today, then
+# insert" sequence per client. This closes the double-tap race where a client
+# fires the check-in flow twice fast enough that both requests pass the SELECT
+# before either INSERT lands, producing two daily_logs rows for the same day.
+# NOTE: this only protects a single bot process. If this bot is ever run with
+# more than one worker/instance, the real fix is a unique constraint in
+# Supabase on (client_id, date(created_at at time zone 'Africa/Addis_Ababa')) —
+# add that at the DB level for a guarantee that holds across instances.
+CHECKIN_LOCKS = defaultdict(asyncio.Lock)
+
 # ------------------------------------------------------------------
 # DUMMY WEB SERVER (Keeps Render Health Checks Active)
 # ------------------------------------------------------------------
@@ -123,6 +147,30 @@ async def send_message_safely(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
     except Exception as err:
         logging.error(f"Failed to send message to {chat_id}: {err}")
         return False
+
+# ------------------------------------------------------------------
+# GLOBAL ERROR HANDLER
+# ------------------------------------------------------------------
+# FIX: previously there was no app.add_error_handler, so an unhandled exception in
+# any handler only ever showed up in stdout logs — no live signal if something like
+# a Supabase outage starts silently dropping updates. This logs with full traceback
+# and pings admins with a short summary so failures surface immediately in Telegram
+# instead of requiring someone to go look at Render logs after the fact.
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logging.error("Unhandled exception while processing an update:", exc_info=context.error)
+    try:
+        err_summary = f"{type(context.error).__name__}: {str(context.error)}"[:400]
+        for admin_id in ADMIN_USER_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"⚠️ <b>Bot Error</b>\n<code>{esc(err_summary)}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 # ------------------------------------------------------------------
 # BACKGROUND JOBS: MOTIVATION & REMINDERS
@@ -230,6 +278,13 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error generating Sunday report: {e}")
 
 async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
+    # NOTE (flagged, not silently changed): unlike the reminder jobs above, this job
+    # does NOT exclude "Meal Plan Only" clients from renewal/testimonial notifications.
+    # That may well be intentional — meal-only clients still have a package that
+    # expires and presumably still need a renewal nudge — but a testimonial ask reads
+    # oddly for a meal-plan-only client who never got coaching touchpoints. Left as-is
+    # since this is a business-logic call, not a bug; let me know if you want meal-only
+    # clients excluded from either or both of these two notifications.
     try:
         # FIX: use package_started_at (resets on renewal/upgrade) instead of created_at
         # (which is the client's original signup date and should stay untouched so
@@ -341,10 +396,13 @@ async def admin_client_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         days = (datetime.now(timezone.utc) - parse_supabase_timestamp(c["created_at"])).days
         checkins = len(supabase.table("daily_logs").select("id").eq("client_id", c["id"]).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data or [])
         
+        # FIX: esc() around package/goal too, not just full_name — they're constrained
+        # to known values today, but this closes the same "unescaped HTML crashes
+        # parse_mode" failure mode for good if either field ever becomes freer-form.
         info = (
             f"👤 <b>INFO: {esc(c.get('full_name'))}</b>\n"
-            f"• <b>ID:</b> {c['id']}\n• <b>Package:</b> {c.get('package')}\n"
-            f"• <b>Goal:</b> {c.get('goal')}\n• <b>Active:</b> {days} days\n"
+            f"• <b>ID:</b> {c['id']}\n• <b>Package:</b> {esc(c.get('package'))}\n"
+            f"• <b>Goal:</b> {esc(c.get('goal'))}\n• <b>Active:</b> {days} days\n"
             f"• <b>7-Day Checkins:</b> {checkins}/7\n"
             f"• <b>Status:</b> {'🟢' if c.get('is_active') else '🔴'}\n"
             f"• <b>Plan Ready:</b> {'✅ Yes' if c.get('plan_ready') else '⏳ Pending'}\n"
@@ -597,12 +655,13 @@ async def handle_client_profile(update: Update, context: ContextTypes.DEFAULT_TY
         days = (datetime.now(timezone.utc) - parse_supabase_timestamp(c["created_at"])).days
         checkins = len(supabase.table("daily_logs").select("id").eq("client_id", c["id"]).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data or [])
         
+        # FIX: esc() around package/goal, matching admin_client_info
         if lang == "en":
-            text = (f"👤 <b>YOUR COACHING PROFILE</b>\n\n• <b>Name:</b> {esc(c.get('full_name'))}\n• <b>Package:</b> {c.get('package')}\n"
-                    f"• <b>Goal:</b> {c.get('goal')}\n• <b>Days Active:</b> {days}\n• <b>7-Day Check-ins:</b> {checkins}/7\n")
+            text = (f"👤 <b>YOUR COACHING PROFILE</b>\n\n• <b>Name:</b> {esc(c.get('full_name'))}\n• <b>Package:</b> {esc(c.get('package'))}\n"
+                    f"• <b>Goal:</b> {esc(c.get('goal'))}\n• <b>Days Active:</b> {days}\n• <b>7-Day Check-ins:</b> {checkins}/7\n")
         else:
-            text = (f"👤 <b>የኮቺንግ መለያዎ / YOUR PROFILE</b>\n\n• <b>ስም:</b> {esc(c.get('full_name'))}\n• <b>የፓኬጅ ዓይነት:</b> {c.get('package')}\n"
-                    f"• <b>ዋና ግብ:</b> {c.get('goal')}\n• <b>የቆይታ ጊዜ:</b> {days} ቀናት\n• <b>የ7 ቀን ክትትል:</b> {checkins}/7 ቀናት\n")
+            text = (f"👤 <b>የኮቺንግ መለያዎ / YOUR PROFILE</b>\n\n• <b>ስም:</b> {esc(c.get('full_name'))}\n• <b>የፓኬጅ ዓይነት:</b> {esc(c.get('package'))}\n"
+                    f"• <b>ዋና ግብ:</b> {esc(c.get('goal'))}\n• <b>የቆይታ ጊዜ:</b> {days} ቀናት\n• <b>የ7 ቀን ክትትል:</b> {checkins}/7 ቀናት\n")
         await query.message.reply_text(text, parse_mode="HTML")
     except Exception:
         await query.message.reply_text("⚠️ Error loading profile.")
@@ -845,39 +904,43 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
             nut = context.user_data.pop("checkin_nut", "Logged")
             second = context.user_data.pop("checkin_second", "Logged")
 
-            try:
-                today_start = get_today_start_utc()  # FIX: EAT-correct boundary
-                if supabase.table("daily_logs").select("id").eq("client_id", u.id).gte("created_at", today_start).execute().data:
-                    await update.message.reply_text("✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nCome back tomorrow to keep your streak going.", parse_mode="HTML")
-                    return
+            # FIX: serialize the check-then-insert per client to close the double-tap
+            # race where two near-simultaneous submissions both pass the "already
+            # checked in?" SELECT before either INSERT completes.
+            async with CHECKIN_LOCKS[u.id]:
+                try:
+                    today_start = get_today_start_utc()  # FIX: EAT-correct boundary
+                    if supabase.table("daily_logs").select("id").eq("client_id", u.id).gte("created_at", today_start).execute().data:
+                        await update.message.reply_text("✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nCome back tomorrow to keep your streak going.", parse_mode="HTML")
+                        return
 
-                supabase.table("daily_logs").insert({
-                    "client_id": u.id,
-                    "nutrition_status": nut,
-                    "hydration_status": second,
-                    "message_text": note
-                }).execute()
-                
-                logs = supabase.table("daily_logs").select("created_at").eq("client_id", u.id).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data
-                streak = len({parse_supabase_timestamp(l["created_at"]).date() for l in logs})
-                celeb = f"\n\n🔥 <b>ድንቅ ክንውን! / MILESTONE UNLOCKED!</b> የ <b>{streak} ቀን</b> የክትትል Streak አስመዝግበዋል!" if streak in [7,14,30] else ""
-                
-                await update.message.reply_text(
-                    f"🎉 <b>ክትትልዎ እና ማስታወሻዎ ተመዝግበዋል! / Check-In Completed!</b>\n"
-                    f"ማስታወሻ፦ <i>{esc(note)}</i>\n"
-                    f"ሳይመን progressዎን በቅርቡ ይገመግማል{celeb}",
-                    parse_mode="HTML"
-                )
+                    supabase.table("daily_logs").insert({
+                        "client_id": u.id,
+                        "nutrition_status": nut,
+                        "hydration_status": second,
+                        "message_text": note
+                    }).execute()
 
-                # Route check-in note to admin chat
-                for a_id in ADMIN_USER_IDS:
-                    await send_message_safely(
-                        context, chat_id=a_id,
-                        text=f"📊 <b>DAILY CHECK-IN NOTE: {esc(u.full_name)}</b>\n• Nutrition: {nut}\n• Recovery/Hydration: {second}\n• Note: <i>{esc(note)}</i>",
+                    logs = supabase.table("daily_logs").select("created_at").eq("client_id", u.id).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data
+                    streak = len({parse_supabase_timestamp(l["created_at"]).date() for l in logs})
+                    celeb = f"\n\n🔥 <b>ድንቅ ክንውን! / MILESTONE UNLOCKED!</b> የ <b>{streak} ቀን</b> የክትትል Streak አስመዝግበዋል!" if streak in [7,14,30] else ""
+
+                    await update.message.reply_text(
+                        f"🎉 <b>ክትትልዎ እና ማስታወሻዎ ተመዝግበዋል! / Check-In Completed!</b>\n"
+                        f"ማስታወሻ፦ <i>{esc(note)}</i>\n"
+                        f"ሳይመን progressዎን በቅርቡ ይገመግማል{celeb}",
                         parse_mode="HTML"
                     )
-            except Exception:
-                await update.message.reply_text("🎉 <b>ክትትልዎ ተመዝግቧል! / Check-In Completed!</b>\nሳይመን progressዎን በቅርቡ ይገመግማል.", parse_mode="HTML")
+
+                    # Route check-in note to admin chat
+                    for a_id in ADMIN_USER_IDS:
+                        await send_message_safely(
+                            context, chat_id=a_id,
+                            text=f"📊 <b>DAILY CHECK-IN NOTE: {esc(u.full_name)}</b>\n• Nutrition: {nut}\n• Recovery/Hydration: {second}\n• Note: <i>{esc(note)}</i>",
+                            parse_mode="HTML"
+                        )
+                except Exception:
+                    await update.message.reply_text("🎉 <b>ክትትልዎ ተመዝግቧል! / Check-In Completed!</b>\nሳይመን progressዎን በቅርቡ ይገመግማል.", parse_mode="HTML")
             return
 
     try:
@@ -906,8 +969,11 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
         if update.message.photo and context.user_data.get("awaiting_payment_screenshot"):
             context.user_data["awaiting_payment_screenshot"] = False
             req_tier = context.user_data.get("pending_tier", "Transformation (60 Days)")
+            # FIX: use the explicit TIER_CODES map instead of req_tier[:3], which could
+            # silently collide between tiers (see TIER_CODES definition above)
+            tier_code = TIER_CODES.get(req_tier, TIER_CODES["Transformation (60 Days)"])
             txt = f"🚨 <b>PAYMENT RECEIPT!</b>\nClient: {esc(u.full_name)} (<code>{u.id}</code>)\nTier: {req_tier}"
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Approve & Set {req_tier}", callback_data=f"approve_tier_{u.id}_{req_tier[:3]}")]])
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Approve & Set {req_tier}", callback_data=f"approve_tier_{u.id}_{tier_code}")]])
             for a_id in ADMIN_USER_IDS:
                 try: await context.bot.send_photo(chat_id=a_id, photo=f_id, caption=txt, reply_markup=kb, parse_mode="HTML")
                 except Exception: pass
@@ -935,14 +1001,10 @@ async def handle_admin_tier_approval(update: Update, context: ContextTypes.DEFAU
     parts = query.data.split("_")
     if len(parts) < 3: return
     t_id = parts[2]
-    tier_map = {
-        "Kic": "Kickstart (21 Days)", 
-        "Tra": "Transformation (60 Days)", 
-        "Eli": "Elite Transformation (90 Days)", 
-        "Lif": "Lifestyle Coaching (6 Months)", 
-        "VIP": "VIP Coaching (6 Months)"
-    }
-    tier = tier_map.get(parts[3] if len(parts) > 3 else "Tra", "Transformation (60 Days)")
+    # FIX: decode the stable tier code via TIER_CODES_REVERSE instead of the old
+    # first-3-letters string map, which could silently collide (see TIER_CODES above)
+    code = parts[3] if len(parts) > 3 else "TRF"
+    tier = TIER_CODES_REVERSE.get(code, "Transformation (60 Days)")
 
     try:
         # FIX: same cycle-reset as /setpackage, applied here since payment approval
@@ -972,6 +1034,11 @@ async def post_init(application):
     scheduler.start()
 
 def main():
+    # NOTE: PicklePersistence writes to a local file on disk (bot_persistence). On
+    # Render, this only survives restarts/redeploys if the service has a persistent
+    # disk mounted at this path — otherwise user_data (pending checkins, pending
+    # payment tier, etc.) is silently wiped on every deploy. Worth confirming your
+    # Render service config; not something fixable from the code side alone.
     app = ApplicationBuilder().token(BOT_TOKEN).persistence(PicklePersistence(filepath="bot_persistence")).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start_command))
@@ -994,6 +1061,10 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_admin_tier_approval, pattern="^approve_tier_"))
 
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_client_attachments))
+
+    # FIX: register the global error handler so unhandled exceptions log with full
+    # traceback and ping admins, instead of only ever showing up in stdout.
+    app.add_error_handler(error_handler)
 
     print("⚡ Bot #2 with Gatekeeper is LIVE! Triple Motivation Schedule active.")
     app.run_polling()
