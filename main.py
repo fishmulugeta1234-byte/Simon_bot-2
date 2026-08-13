@@ -296,17 +296,7 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error generating Sunday report: {e}")
 
 async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
-    # NOTE (flagged, not silently changed): unlike the reminder jobs above, this job
-    # does NOT exclude "Meal Plan Only" clients from renewal/testimonial notifications.
-    # That may well be intentional — meal-only clients still have a package that
-    # expires and presumably still need a renewal nudge — but a testimonial ask reads
-    # oddly for a meal-plan-only client who never got coaching touchpoints. Left as-is
-    # since this is a business-logic call, not a bug; let me know if you want meal-only
-    # clients excluded from either or both of these two notifications.
     try:
-        # FIX: use package_started_at (resets on renewal/upgrade) instead of created_at
-        # (which is the client's original signup date and should stay untouched so
-        # /clientinfo and profile views keep showing true account age)
         res = supabase.table("clients").select("id, package, created_at, package_started_at, renewal_notified, testimonial_notified").eq("is_active", True).execute()
         if not res.data: return
         now = datetime.now(timezone.utc)
@@ -357,8 +347,6 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Usage: `/broadcast [message]`", parse_mode="HTML")
         return
 
-    # FIX: context.args is whitespace-tokenized, which collapses newlines the admin
-    # typed. Pull the raw text after the command instead, so formatting/line breaks survive.
     raw_text = update.message.text.split(maxsplit=1)
     body = raw_text[1] if len(raw_text) > 1 else ""
     text = "📢 <b>ANNOUNCEMENT FROM ሳይመን / ማስታወቂያ</b>\n\n" + body
@@ -385,9 +373,6 @@ async def admin_set_package(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # FIX: reset the cycle clock and notification flags so renewals/upgrades
-        # get their own fresh expiration + testimonial timeline instead of inheriting
-        # the flags from whatever package the client was on before
         supabase.table("clients").update({
             "package": tier_name,
             "package_started_at": datetime.now(timezone.utc).isoformat(),
@@ -414,9 +399,6 @@ async def admin_client_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         days = (datetime.now(timezone.utc) - parse_supabase_timestamp(c["created_at"])).days
         checkins = len(supabase.table("daily_logs").select("id").eq("client_id", c["id"]).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data or [])
         
-        # FIX: esc() around package/goal too, not just full_name — they're constrained
-        # to known values today, but this closes the same "unescaped HTML crashes
-        # parse_mode" failure mode for good if either field ever becomes freer-form.
         info = (
             f"👤 <b>INFO: {esc(c.get('full_name'))}</b>\n"
             f"• <b>ID:</b> {c['id']}\n• <b>Package:</b> {esc(c.get('package'))}\n"
@@ -429,9 +411,6 @@ async def admin_client_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error: {e}")
 
-# FIX: admin_send_plan now
-#   1) accepts a document attached to the command message OR the message being replied to
-#   2) validates p_type instead of silently defaulting unknown values to "workout"
 async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS:
         return
@@ -468,8 +447,6 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "plan_ready": True
         }).eq("id", c_id).execute()
 
-        # FIX: give the client a tappable button instead of telling them to "open the
-        # main menu" with no way to actually do that besides typing /start manually
         menu_markup = await get_main_menu_markup(c_id)
         await send_message_safely(
             context, chat_id=c_id, parse_mode="HTML",
@@ -484,10 +461,6 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_send_voice_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS: return
 
-    # FIX: same reply-fallback as /sendplan and /sendfile — accept a voice note either
-    # attached directly to the command, or on the message being replied to. Previously
-    # this only worked if the command was typed as the voice note's caption, which is
-    # fragile the same way /sendplan's caption-only flow was.
     voice = update.message.voice or (
         update.message.reply_to_message.voice if update.message.reply_to_message else None
     )
@@ -516,8 +489,6 @@ async def admin_status_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     
     try:
-        # FIX: order by created_at so "Last 5 Registrations" is actually the most
-        # recent signups, not just whatever 5 rows Supabase happened to return last
         res = supabase.table("clients").select("full_name, package, is_active, plan_ready, created_at").order("created_at", desc=True).execute()
         clients = res.data or []
         
@@ -545,12 +516,6 @@ async def admin_status_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"⚠️ Failed to fetch status: {e}")
 
 async def admin_view_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """NEW: /questions [count] — shows the most recent saved client text
-    questions from client_media (the ones non-priority tiers get told
-    'Simon will address this in your next check-in', which otherwise have
-    no way to surface to an admin). Read-only, doesn't mark anything as
-    answered — just a way to review what's queued up. Defaults to 10,
-    accepts an optional count argument up to 30."""
     if update.effective_user.id not in ADMIN_USER_IDS:
         return
 
@@ -598,7 +563,6 @@ async def admin_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS: 
         return
     
-    # FIX: same reply-fallback as admin_send_plan, for consistency
     doc = update.message.document or (
         update.message.reply_to_message.document if update.message.reply_to_message else None
     )
@@ -723,7 +687,6 @@ async def handle_client_profile(update: Update, context: ContextTypes.DEFAULT_TY
         days = (datetime.now(timezone.utc) - parse_supabase_timestamp(c["created_at"])).days
         checkins = len(supabase.table("daily_logs").select("id").eq("client_id", c["id"]).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data or [])
         
-        # FIX: esc() around package/goal, matching admin_client_info
         if lang == "en":
             text = (f"👤 <b>YOUR COACHING PROFILE</b>\n\n• <b>Name:</b> {esc(c.get('full_name'))}\n• <b>Package:</b> {esc(c.get('package'))}\n"
                     f"• <b>Goal:</b> {esc(c.get('goal'))}\n• <b>Days Active:</b> {days}\n• <b>7-Day Check-ins:</b> {checkins}/7\n")
@@ -767,7 +730,6 @@ async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     u_id = query.from_user.id
 
-    # FIX: entering the upgrade flow fresh means any old pending state is stale — clear it
     context.user_data.pop("pending_tier", None)
     context.user_data["awaiting_payment_screenshot"] = False
 
@@ -781,8 +743,6 @@ async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logging.error(f"Error checking location_type for upgrade {u_id}: {e}")
 
-    # FIX: full tier name for each row, used to skip whichever one the client is already on
-    # (kept in sync with the callback->tier mapping in handle_upgrade_payment_info)
     tier_rows_et = [
         ("Kickstart (21 Days)", "⚡ Kickstart (21 Days) — 4,500 ETB", "upgrade_kickstart"),
         ("Transformation (60 Days)", "🔥 Transformation (60 Days) — 8,900 ETB", "upgrade_transformation"),
@@ -801,10 +761,6 @@ async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TY
     rows = tier_rows_et if loc_type == "et" else tier_rows_intl
     keyboard = []
     for (tier_name, label, cb) in rows:
-        # FIX: keep the client's current tier visible but relabeled as a renewal —
-        # this button is reused both for mid-program upgrades and for the
-        # "Package Expiring Soon" renewal prompt, and a client finishing their
-        # program usually wants to buy the SAME tier again, not just a higher one
         if tier_name == current_package:
             keyboard.append([InlineKeyboardButton(f"{label} (🔁 Renew Same Plan)", callback_data=cb)])
         else:
@@ -845,8 +801,6 @@ async def handle_upgrade_payment_info(update: Update, context: ContextTypes.DEFA
     }
     sel = tier_map.get(query.data, "Transformation (60 Days)")
     context.user_data["pending_tier"] = sel
-    # FIX: explicit flag so the next photo this user sends is unambiguously a payment
-    # receipt, instead of inferring that from "a photo arrived" (see handle_client_attachments)
     context.user_data["awaiting_payment_screenshot"] = True
 
     if loc_type == "et":
@@ -876,7 +830,7 @@ async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TY
     u_id = query.from_user.id
 
     try:
-        today_start = get_today_start_utc()  # FIX: EAT-correct boundary
+        today_start = get_today_start_utc()
         if supabase.table("daily_logs").select("id").eq("client_id", u_id).gte("created_at", today_start).execute().data:
             await query.message.reply_text("✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nአስደናቂ ወጥነት! Streak እንዳይቋረጥ ነገ ይመለሱ! 🔥", parse_mode="HTML")
             return
@@ -907,7 +861,6 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
     if query.data in ["log_nut_hit", "log_nut_miss"]:
         context.user_data["checkin_nut"] = "Hit" if query.data == "log_nut_hit" else "Missed"
 
-        # FIX: guard against a missing/empty client row instead of indexing .data[0] blindly
         try:
             res = supabase.table("clients").select("goal").eq("id", u_id).execute()
             goal = res.data[0].get("goal", "goal_fat_loss") if res.data else "goal_fat_loss"
@@ -927,9 +880,6 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
         second = "Hit" if query.data == "log_second_hit" else "Missed"
         context.user_data["checkin_second"] = second
         context.user_data["awaiting_checkin_note"] = True
-        # FIX: timestamp this so a client who never answers doesn't have their next
-        # unrelated message (a real question, a photo) silently swallowed into a
-        # check-in note forever
         context.user_data["awaiting_checkin_note_started_at"] = datetime.now(timezone.utc).isoformat()
 
         await query.message.reply_text(
@@ -945,11 +895,7 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
     u = update.effective_user
     if not u or not update.message: return
 
-    # Check if client is currently in the checkin note-writing step
     if context.user_data.get("awaiting_checkin_note"):
-        # FIX: if the prompt is stale (client went silent for a while and this is
-        # actually a new, unrelated message), clear the flag and fall through to
-        # normal handling below instead of misfiling it as the check-in note
         started_raw = context.user_data.get("awaiting_checkin_note_started_at")
         is_stale = True
         if started_raw:
@@ -964,7 +910,6 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
             context.user_data.pop("awaiting_checkin_note_started_at", None)
             context.user_data.pop("checkin_nut", None)
             context.user_data.pop("checkin_second", None)
-            # no return — falls through to the normal media/Q&A handling below
         else:
             context.user_data["awaiting_checkin_note"] = False
             context.user_data.pop("awaiting_checkin_note_started_at", None)
@@ -972,38 +917,23 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
             nut = context.user_data.pop("checkin_nut", "Logged")
             second = context.user_data.pop("checkin_second", "Logged")
 
-            # FIX: serialize the check-then-insert per client to close the double-tap
-            # race where two near-simultaneous submissions both pass the "already
-            # checked in?" SELECT before either INSERT completes. This is a fast-path
-            # only — the real backstop is the DB-level unique constraint on
-            # (client_id, log_date) described in the migration note below, which makes
-            # a duplicate impossible even if this in-process check ever fails to fire.
             async with CHECKIN_LOCKS[u.id]:
                 try:
-                    today_start = get_today_start_utc()  # FIX: EAT-correct boundary
+                    today_start = get_today_start_utc()
                     if supabase.table("daily_logs").select("id").eq("client_id", u.id).gte("created_at", today_start).execute().data:
                         await update.message.reply_text("✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nCome back tomorrow to keep your streak going.", parse_mode="HTML")
                         return
 
                     try:
-                        # FIX: explicitly set created_at instead of relying on a table
-                        # default that may not exist. Without this, if the DB column had
-                        # no now()-default, every row's created_at came back NULL, which
-                        # made the "already checked in today?" gte() query above never
-                        # match anything — the root cause of infinite check-ins per day.
+                        # FIX APPLIED HERE: changed message_text -> notes to match Supabase schema
                         supabase.table("daily_logs").insert({
                             "client_id": u.id,
                             "nutrition_status": nut,
                             "hydration_status": second,
-                            "message_text": note,
+                            "notes": note,
                             "created_at": datetime.now(timezone.utc).isoformat(),
                         }).execute()
                     except Exception as insert_err:
-                        # FIX: if a DB-level unique constraint on (client_id, log_date)
-                        # is in place (see migration note in check_expirations_and_streaks
-                        # docstring / README), a genuine duplicate lands here instead of
-                        # silently succeeding. Tell the client the truth instead of
-                        # claiming success either way.
                         err_str = str(insert_err).lower()
                         if "duplicate" in err_str or "unique" in err_str or "daily_logs_one_per_day" in err_str:
                             await update.message.reply_text(
@@ -1061,14 +991,9 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
 
         await update.message.reply_text("Got it! 🎥 Your attachment has been saved for ሳይመን's review.", parse_mode="HTML")
 
-        # FIX: only treat this photo as a payment receipt if the user was actually sent
-        # to the payment-instructions screen. Previously ANY photo (form checks, progress
-        # pics) triggered the "PAYMENT RECEIPT! Approve tier" admin alert.
         if update.message.photo and context.user_data.get("awaiting_payment_screenshot"):
             context.user_data["awaiting_payment_screenshot"] = False
             req_tier = context.user_data.get("pending_tier", "Transformation (60 Days)")
-            # FIX: use the explicit TIER_CODES map instead of req_tier[:3], which could
-            # silently collide between tiers (see TIER_CODES definition above)
             tier_code = TIER_CODES.get(req_tier, TIER_CODES["Transformation (60 Days)"])
             txt = f"🚨 <b>PAYMENT RECEIPT!</b>\nClient: {esc(u.full_name)} (<code>{u.id}</code>)\nTier: {req_tier}"
             kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Approve & Set {req_tier}", callback_data=f"approve_tier_{u.id}_{tier_code}")]])
@@ -1099,14 +1024,10 @@ async def handle_admin_tier_approval(update: Update, context: ContextTypes.DEFAU
     parts = query.data.split("_")
     if len(parts) < 3: return
     t_id = parts[2]
-    # FIX: decode the stable tier code via TIER_CODES_REVERSE instead of the old
-    # first-3-letters string map, which could silently collide (see TIER_CODES above)
     code = parts[3] if len(parts) > 3 else "TRF"
     tier = TIER_CODES_REVERSE.get(code, "Transformation (60 Days)")
 
     try:
-        # FIX: same cycle-reset as /setpackage, applied here since payment approval
-        # is the other path that changes a client's package
         supabase.table("clients").update({
             "package": tier,
             "package_started_at": datetime.now(timezone.utc).isoformat(),
@@ -1132,11 +1053,6 @@ async def post_init(application):
     scheduler.start()
 
 def main():
-    # NOTE: PicklePersistence writes to a local file on disk (bot_persistence). On
-    # Render, this only survives restarts/redeploys if the service has a persistent
-    # disk mounted at this path — otherwise user_data (pending checkins, pending
-    # payment tier, etc.) is silently wiped on every deploy. Worth confirming your
-    # Render service config; not something fixable from the code side alone.
     app = ApplicationBuilder().token(BOT_TOKEN).persistence(PicklePersistence(filepath="bot_persistence")).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start_command))
@@ -1161,8 +1077,6 @@ def main():
 
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_client_attachments))
 
-    # FIX: register the global error handler so unhandled exceptions log with full
-    # traceback and ping admins, instead of only ever showing up in stdout.
     app.add_error_handler(error_handler)
 
     print("⚡ Bot #2 with Gatekeeper is LIVE! Triple Motivation Schedule active.")
