@@ -544,6 +544,56 @@ async def admin_status_command(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         await update.message.reply_text(f"⚠️ Failed to fetch status: {e}")
 
+async def admin_view_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """NEW: /questions [count] — shows the most recent saved client text
+    questions from client_media (the ones non-priority tiers get told
+    'Simon will address this in your next check-in', which otherwise have
+    no way to surface to an admin). Read-only, doesn't mark anything as
+    answered — just a way to review what's queued up. Defaults to 10,
+    accepts an optional count argument up to 30."""
+    if update.effective_user.id not in ADMIN_USER_IDS:
+        return
+
+    limit = 10
+    if context.args:
+        try:
+            limit = max(1, min(30, int(context.args[0])))
+        except ValueError:
+            pass
+
+    try:
+        res = (
+            supabase.table("client_media")
+            .select("client_id, message_text, created_at")
+            .eq("media_type", "text")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            await update.message.reply_text("📭 No saved client questions found.")
+            return
+
+        client_ids = list({r["client_id"] for r in rows})
+        names_res = supabase.table("clients").select("id, full_name").in_("id", client_ids).execute()
+        name_map = {c["id"]: c.get("full_name", "Unknown") for c in (names_res.data or [])}
+
+        lines = [f"📝 <b>RECENT CLIENT QUESTIONS (last {len(rows)})</b>\n"]
+        for r in rows:
+            name = esc(name_map.get(r["client_id"], "Unknown"))
+            when = ""
+            try:
+                when = parse_supabase_timestamp(r["created_at"]).astimezone(EAT_TIMEZONE).strftime("%b %d, %I:%M %p")
+            except Exception:
+                pass
+            lines.append(f"• <b>{name}</b> (<code>{r['client_id']}</code>){' — ' + when if when else ''}\n  <i>{esc(r.get('message_text', ''))}</i>\n")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Error fetching client questions: {e}")
+        await update.message.reply_text(f"⚠️ Failed to fetch questions: {e}")
+
 async def admin_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS: 
         return
@@ -1097,6 +1147,7 @@ def main():
     app.add_handler(CommandHandler("reply", admin_send_voice_feedback))
     app.add_handler(CommandHandler("status", admin_status_command))
     app.add_handler(CommandHandler("sendfile", admin_send_file))
+    app.add_handler(CommandHandler("questions", admin_view_questions))
 
     app.add_handler(CallbackQueryHandler(handle_target_plan, pattern="^get_target_plan$"))
     app.add_handler(CallbackQueryHandler(handle_client_profile, pattern="^get_client_profile$"))
