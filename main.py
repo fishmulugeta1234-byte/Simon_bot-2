@@ -73,11 +73,7 @@ TIER_PERMISSIONS = {
     "VIP Coaching (6 Months)": {"allow_media": True, "allow_qa": True, "priority": True},
 }
 
-# FIX: stable, collision-proof short codes for tier callback_data. Previously
-# tier_name[:3] was used ("Elite Transformation"[:3] == "Eli"), which silently
-# breaks the moment two tiers share a 3-letter prefix. These codes are explicit
-# and independent of tier naming, and both directions (encode/decode) are kept
-# in sync from one dict so there's a single source of truth.
+# FIX: stable, collision-proof short codes for tier callback_data.
 TIER_CODES = {
     "Kickstart (21 Days)": "KS",
     "Transformation (60 Days)": "TRF",
@@ -87,14 +83,7 @@ TIER_CODES = {
 }
 TIER_CODES_REVERSE = {v: k for k, v in TIER_CODES.items()}
 
-# FIX: in-process locks to serialize the "check if already logged today, then
-# insert" sequence per client. This closes the double-tap race where a client
-# fires the check-in flow twice fast enough that both requests pass the SELECT
-# before either INSERT lands, producing two daily_logs rows for the same day.
-# NOTE: this only protects a single bot process. If this bot is ever run with
-# more than one worker/instance, the real fix is a unique constraint in
-# Supabase on (client_id, date(created_at at time zone 'Africa/Addis_Ababa')) —
-# add that at the DB level for a guarantee that holds across instances.
+# FIX: in-process locks to serialize the check-in flow per client.
 CHECKIN_LOCKS = defaultdict(asyncio.Lock)
 
 # ------------------------------------------------------------------
@@ -117,10 +106,6 @@ async def start_web_server():
 # HELPERS
 # ------------------------------------------------------------------
 def esc(value) -> str:
-    """Escape user-supplied text before interpolating into an HTML parse_mode message.
-    Unescaped '<', '>', '&' in a name/note/question crashes send_message with
-    telegram.error.BadRequest: Can't parse entities — same failure as the /sendplan
-    usage-string bug, but triggered by client input instead of our own code."""
     if value is None:
         return ""
     return html.escape(str(value))
@@ -141,11 +126,6 @@ def parse_supabase_timestamp(ts: str) -> datetime:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
-# FIX: single source of truth for "start of today" in EAT, converted to UTC for
-# comparison against Supabase's UTC timestamps. Previously every call site computed
-# this from datetime.now(timezone.utc).replace(hour=0,...), which is UTC midnight,
-# not EAT midnight (EAT is UTC+3) -- causing checkins between 00:00-03:00 EAT to be
-# attributed to the wrong day.
 def get_today_start_utc() -> str:
     now_eat = datetime.now(EAT_TIMEZONE)
     start_eat = now_eat.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -169,11 +149,6 @@ async def send_message_safely(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
 # ------------------------------------------------------------------
 # GLOBAL ERROR HANDLER
 # ------------------------------------------------------------------
-# FIX: previously there was no app.add_error_handler, so an unhandled exception in
-# any handler only ever showed up in stdout logs — no live signal if something like
-# a Supabase outage starts silently dropping updates. This logs with full traceback
-# and pings admins with a short summary so failures surface immediately in Telegram
-# instead of requiring someone to go look at Render logs after the fact.
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logging.error("Unhandled exception while processing an update:", exc_info=context.error)
     try:
@@ -221,7 +196,7 @@ async def send_daily_checkin_reminders(context: ContextTypes.DEFAULT_TYPE):
             return
 
         clients = [c for c in res.data if "Meal Plan Only" not in c.get("package", "")]
-        today_start = get_today_start_utc()  # FIX: EAT-correct boundary
+        today_start = get_today_start_utc()
         
         logs_res = supabase.table("daily_logs").select("client_id").in_("client_id", [c["id"] for c in clients]).gte("created_at", today_start).execute()
         already_checked_in = {log["client_id"] for log in (logs_res.data or [])}
@@ -249,7 +224,7 @@ async def send_late_night_reminders(context: ContextTypes.DEFAULT_TYPE):
             return
 
         clients = [c for c in res.data if "Meal Plan Only" not in c.get("package", "")]
-        today_start = get_today_start_utc()  # FIX: EAT-correct boundary
+        today_start = get_today_start_utc()
         
         logs_res = supabase.table("daily_logs").select("client_id").in_("client_id", [c["id"] for c in clients]).gte("created_at", today_start).execute()
         already_checked_in = {log["client_id"] for log in (logs_res.data or [])}
@@ -872,8 +847,9 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
             kb = [[InlineKeyboardButton("💤 7+ ሰዓት ተኝቻለሁ", callback_data="log_second_hit")], [InlineKeyboardButton("❌ በቂ እረፍት አላገኘሁም", callback_data="log_second_miss")]]
             text = "💤 <b>የእረፍት ክትትል / RECOVERY CHECK</b>\nበቂ (7+ ሰዓት) እረፍት አድርገዋል? / Did you hit your sleep target?"
         else:
-            kb = [[InlineKeyboardButton("💧 3.5 ሊትር ውኃ ጠጥቻለሁ", callback_data="log_second_hit")], [InlineKeyboardButton("❌ ውኃ አልሞላሁም", callback_data="log_second_miss")]]
-            text = "💧 <b>የውኃ ክትትል / HYDRATION CHECK</b>\n3.5 ሊትር ውኃ ጠጥተዋል? / Did you hit your 3.5L water target?"
+            # UPDATED: Changed from hardcoded 3.5L to plan-based hydration prompt
+            kb = [[InlineKeyboardButton("💧 በእቅዱ መሰረት ጠጥቻለሁ", callback_data="log_second_hit")], [InlineKeyboardButton("❌ አልሞላሁም / Missed", callback_data="log_second_miss")]]
+            text = "💧 <b>የውኃ ክትትል / HYDRATION CHECK</b>\nበእቅዱ መሰረት ውኃ ጠጥተዋል? / Did you drink water according to your plan?"
         await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
     elif query.data in ["log_second_hit", "log_second_miss"]:
@@ -925,7 +901,6 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
                         return
 
                     try:
-                        # FIX APPLIED HERE: changed message_text -> notes to match Supabase schema
                         supabase.table("daily_logs").insert({
                             "client_id": u.id,
                             "nutrition_status": nut,
