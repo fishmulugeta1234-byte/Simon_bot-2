@@ -44,6 +44,24 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 EAT_TIMEZONE = ZoneInfo("Africa/Addis_Ababa")
 
 # ------------------------------------------------------------------
+# REQUIRED SUPABASE MIGRATION (run once in the SQL editor)
+# ------------------------------------------------------------------
+# The app-level "already checked in today?" check is now a fast-path only.
+# For a real guarantee against duplicate check-ins (survives races, bugs,
+# missing created_at, etc.), run this once against the daily_logs table:
+#
+#   alter table daily_logs
+#     add column log_date date generated always as
+#       ((created_at at time zone 'Africa/Addis_Ababa')::date) stored;
+#
+#   alter table daily_logs
+#     add constraint daily_logs_one_per_day unique (client_id, log_date);
+#
+# After this, a duplicate insert raises an exception that the code below
+# catches and reports back to the client as "already checked in" instead of
+# silently succeeding or silently failing.
+
+# ------------------------------------------------------------------
 # TIER PERMISSIONS DEFINITION (SYNCHRONIZED WITH BOT 1)
 # ------------------------------------------------------------------
 TIER_PERMISSIONS = {
@@ -906,7 +924,10 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
 
             # FIX: serialize the check-then-insert per client to close the double-tap
             # race where two near-simultaneous submissions both pass the "already
-            # checked in?" SELECT before either INSERT completes.
+            # checked in?" SELECT before either INSERT completes. This is a fast-path
+            # only — the real backstop is the DB-level unique constraint on
+            # (client_id, log_date) described in the migration note below, which makes
+            # a duplicate impossible even if this in-process check ever fails to fire.
             async with CHECKIN_LOCKS[u.id]:
                 try:
                     today_start = get_today_start_utc()  # FIX: EAT-correct boundary
@@ -914,12 +935,38 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
                         await update.message.reply_text("✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nCome back tomorrow to keep your streak going.", parse_mode="HTML")
                         return
 
-                    supabase.table("daily_logs").insert({
-                        "client_id": u.id,
-                        "nutrition_status": nut,
-                        "hydration_status": second,
-                        "message_text": note
-                    }).execute()
+                    try:
+                        # FIX: explicitly set created_at instead of relying on a table
+                        # default that may not exist. Without this, if the DB column had
+                        # no now()-default, every row's created_at came back NULL, which
+                        # made the "already checked in today?" gte() query above never
+                        # match anything — the root cause of infinite check-ins per day.
+                        supabase.table("daily_logs").insert({
+                            "client_id": u.id,
+                            "nutrition_status": nut,
+                            "hydration_status": second,
+                            "message_text": note,
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                        }).execute()
+                    except Exception as insert_err:
+                        # FIX: if a DB-level unique constraint on (client_id, log_date)
+                        # is in place (see migration note in check_expirations_and_streaks
+                        # docstring / README), a genuine duplicate lands here instead of
+                        # silently succeeding. Tell the client the truth instead of
+                        # claiming success either way.
+                        err_str = str(insert_err).lower()
+                        if "duplicate" in err_str or "unique" in err_str or "daily_logs_one_per_day" in err_str:
+                            await update.message.reply_text(
+                                "✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nCome back tomorrow to keep your streak going.",
+                                parse_mode="HTML"
+                            )
+                            return
+                        logging.error(f"Failed to insert daily log for {u.id}: {insert_err}")
+                        await update.message.reply_text(
+                            "⚠️ Something went wrong saving your check-in — please try again in a moment.",
+                            parse_mode="HTML"
+                        )
+                        return
 
                     logs = supabase.table("daily_logs").select("created_at").eq("client_id", u.id).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data
                     streak = len({parse_supabase_timestamp(l["created_at"]).date() for l in logs})
@@ -939,8 +986,9 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
                             text=f"📊 <b>DAILY CHECK-IN NOTE: {esc(u.full_name)}</b>\n• Nutrition: {nut}\n• Recovery/Hydration: {second}\n• Note: <i>{esc(note)}</i>",
                             parse_mode="HTML"
                         )
-                except Exception:
-                    await update.message.reply_text("🎉 <b>ክትትልዎ ተመዝግቧል! / Check-In Completed!</b>\nሳይመን progressዎን በቅርቡ ይገመግማል.", parse_mode="HTML")
+                except Exception as e:
+                    logging.error(f"Unexpected error in check-in flow for {u.id}: {e}")
+                    await update.message.reply_text("⚠️ Something went wrong saving your check-in — please try again in a moment.", parse_mode="HTML")
             return
 
     try:
