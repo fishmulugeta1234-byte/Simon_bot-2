@@ -6,7 +6,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, BotCommand
 from telegram.error import Forbidden
 from telegram.ext import (
     ApplicationBuilder,
@@ -629,12 +629,133 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     markup = await get_main_menu_markup(user_id)
+    
+    # Persistent keyboard at the bottom for quick access
+    reply_kb = ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📊 Daily Check-In"), KeyboardButton("👤 My Profile")],
+            [KeyboardButton("📖 My Target Plan"), KeyboardButton("🔄 Upgrade Package")]
+        ],
+        resize_keyboard=True
+    )
+    
     await update.message.reply_text(
         "እንኳን ወደ ሲሞን ኦሪጅን የክትትል እና ኮቺንግ ፖርታል በደህና መጡ! 🎯\n"
         "Welcome to Simon Origin Tracking & Coaching Portal! 🎯\n\n"
         "ቋንቋ ለመቀየር ወይም ለመጀመር ከታች ያሉትን ይጫኑ / Select an option below:",
         reply_markup=markup,
     )
+    # Send the persistent reply keyboard so it stays anchored at the bottom
+    await update.message.reply_text(
+        "👇 <b>ቋሚ ማኑ ከታች ተስተካክሏል / Persistent bottom menu active:</b>",
+        reply_markup=reply_kb,
+        parse_mode="HTML"
+    )
+
+async def handle_reply_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text in ["📊 Daily Check-In", "📊 የዕለት ክትትል"]:
+        # Trigger check-in directly via simulated query/flow
+        u_id = update.effective_user.id
+        try:
+            today_start = get_today_start_utc()
+            if supabase.table("daily_logs").select("id").eq("client_id", u_id).gte("created_at", today_start).execute().data:
+                await update.message.reply_text("✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>", parse_mode="HTML")
+                return
+            res = supabase.table("clients").select("goal").eq("id", u_id).execute()
+            goal = res.data[0].get("goal") if res.data else "goal_fat_loss"
+        except Exception:
+            goal = "goal_fat_loss"
+
+        if goal == "goal_muscle":
+            kb = [[InlineKeyboardButton("🎯 ፕሮቲን እና ካሎሪ ሞልቻለሁ", callback_data="log_nut_hit")], [InlineKeyboardButton("⚠️ ፕሮቲን/ካሎሪ አጎድያለሁ", callback_data="log_nut_miss")]]
+            text_prompt = "🔔 <b>የጡንቻ ግንባታ ክትትል / MUSCLE BUILDING CHECK-IN</b>\nየፕሮቲን እና ካሎሪ መጠንዎን ሞልተዋል?"
+        else:
+            kb = [[InlineKeyboardButton("🎯 የካሎሪ ገደብ ጠብቄአለሁ", callback_data="log_nut_hit")], [InlineKeyboardButton("⚠️ የካሎሪ ገደብ አልጠበቅሁም", callback_data="log_nut_miss")]]
+            text_prompt = "🔔 <b>የስብ መቀነስ ክትትል / FAT LOSS CHECK-IN</b>\nየካሎሪ ገደብዎን ጠብቀዋል?"
+        await update.message.reply_text(text_prompt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+
+    elif text in ["👤 My Profile", "👤 መለያዬ"]:
+        u_id = update.effective_user.id
+        lang = await get_client_language(u_id)
+        try:
+            res = supabase.table("clients").select("*").eq("id", u_id).execute()
+            if not res.data:
+                await update.message.reply_text("📋 Profile not found." if lang == "en" else "📋 መረጃዎ አልተገኘም።")
+                return
+            c = res.data[0]
+            days = (datetime.now(timezone.utc) - parse_supabase_timestamp(c["created_at"])).days
+            checkins = len(supabase.table("daily_logs").select("id").eq("client_id", c["id"]).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data or [])
+            if lang == "en":
+                profile_text = f"👤 <b>YOUR COACHING PROFILE</b>\n\n• <b>Name:</b> {esc(c.get('full_name'))}\n• <b>Package:</b> {esc(c.get('package'))}\n• <b>Goal:</b> {esc(c.get('goal'))}\n• <b>Days Active:</b> {days}\n• <b>7-Day Check-ins:</b> {checkins}/7"
+            else:
+                profile_text = f"👤 <b>የኮቺንግ መለያዎ / YOUR PROFILE</b>\n\n• <b>ስም:</b> {esc(c.get('full_name'))}\n• <b>የፓኬጅ ዓይነት:</b> {esc(c.get('package'))}\n• <b>ዋና ግብ:</b> {esc(c.get('goal'))}\n• <b>የቆይታ ጊዜ:</b> {days} ቀናት\n• <b>የ7 ቀን ክትትል:</b> {checkins}/7 ቀናት"
+            await update.message.reply_text(profile_text, parse_mode="HTML")
+        except Exception:
+            await update.message.reply_text("⚠️ Error loading profile.")
+
+    elif text in ["📖 My Target Plan", "📖 የእኔ እቅድ"]:
+        u_id = update.effective_user.id
+        lang = await get_client_language(u_id)
+        try:
+            res = supabase.table("clients").select("*").eq("id", u_id).execute()
+            if not res.data: return
+            c = res.data[0]
+            is_meal_only = "Meal Plan Only" in c.get("package", "")
+            await update.message.reply_text("📋 <b>NUTRITION BLUEPRINT / የምግብ እቅድ</b>" if is_meal_only else "📋 <b>FULL COACHING BLUEPRINT / የኮቺንግ እቅድ</b>", parse_mode="HTML")
+            if c.get("meal_plan_url"):
+                await context.bot.send_document(chat_id=u_id, document=c["meal_plan_url"], caption="🔗 Meal Plan")
+            else:
+                await update.message.reply_text("🔗 Meal Plan: Not Uploaded Yet" if lang == "en" else "🔗 የምግብ እቅድ፦ እስካሁን አልተጫነም")
+            if not is_meal_only:
+                if c.get("workout_plan_url"):
+                    await context.bot.send_document(chat_id=u_id, document=c["workout_plan_url"], caption="🏋️ Workout Plan")
+                else:
+                    await update.message.reply_text("🏋️ Workout Plan: Not Uploaded Yet" if lang == "en" else "🏋️ የአካል ብቃት እቅድ፦ እስካሁን አልተጫነም")
+        except Exception:
+            await update.message.reply_text("⚠️ Error fetching plans.")
+
+    elif text in ["🔄 Upgrade Package", "🔄 ፓኬጅ ማሻሻያ"]:
+        u_id = update.effective_user.id
+        context.user_data.pop("pending_tier", None)
+        context.user_data["awaiting_payment_screenshot"] = False
+        loc_type = "et"
+        current_package = None
+        try:
+            res = supabase.table("clients").select("location_type, package").eq("id", u_id).execute()
+            if res.data and len(res.data) > 0:
+                loc_type = res.data[0].get("location_type", "et")
+                current_package = res.data[0].get("package")
+        except Exception:
+            pass
+
+        tier_rows_et = [
+            ("Kickstart (21 Days)", "⚡ Kickstart (21 Days) — 4,500 ETB", "upgrade_kickstart"),
+            ("Transformation (60 Days)", "🔥 Transformation (60 Days) — 8,900 ETB", "upgrade_transformation"),
+            ("Elite Transformation (90 Days)", "🥇 Elite (90 Days) — 12,500 ETB", "upgrade_elite"),
+            ("Lifestyle Coaching (6 Months)", "🌟 Lifestyle (6 Months) — 24,000 ETB", "upgrade_lifestyle"),
+            ("VIP Coaching (6 Months)", "👑 VIP Coaching (6 Months) — 39,000 ETB", "upgrade_vip"),
+        ]
+        tier_rows_intl = [
+            ("Kickstart (21 Days)", "⚡ Kickstart (21 Days) — $50", "upgrade_kickstart"),
+            ("Transformation (60 Days)", "🔥 Transformation (60 Days) — $119", "upgrade_transformation"),
+            ("Elite Transformation (90 Days)", "🥇 Elite (90 Days) — $159", "upgrade_elite"),
+            ("Lifestyle Coaching (6 Months)", "🌟 Lifestyle (6 Months) — $299", "upgrade_lifestyle"),
+            ("VIP Coaching (6 Months)", "👑 VIP Coaching (6 Months) — $549", "upgrade_vip"),
+        ]
+        rows = tier_rows_et if loc_type == "et" else tier_rows_intl
+        keyboard = []
+        for (tier_name, label, cb) in rows:
+            if tier_name == current_package:
+                keyboard.append([InlineKeyboardButton(f"{label} (🔁 Renew Same Plan)", callback_data=cb)])
+            else:
+                keyboard.append([InlineKeyboardButton(label, callback_data=cb)])
+        contact_label = "📲 ከሳይመን ጋር መነጋገር" if loc_type == "et" else "📲 Contact Simon"
+        keyboard.append([InlineKeyboardButton(contact_label, url="https://t.me/s_simon_19")])
+        await update.message.reply_text(
+            "🏋️ <b>ፓኬጅ ማሻሻያ / UPGRADE TO FULL COACHING</b>\n\nከታች የሚፈልጉትን ፓኬጅ ይምረጡ:",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
+        )
 
 async def handle_language_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -847,7 +968,6 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
             kb = [[InlineKeyboardButton("💤 7+ ሰዓት ተኝቻለሁ", callback_data="log_second_hit")], [InlineKeyboardButton("❌ በቂ እረፍት አላገኘሁም", callback_data="log_second_miss")]]
             text = "💤 <b>የእረፍት ክትትል / RECOVERY CHECK</b>\nበቂ (7+ ሰዓት) እረፍት አድርገዋል? / Did you hit your sleep target?"
         else:
-            # UPDATED: Changed from hardcoded 3.5L to plan-based hydration prompt
             kb = [[InlineKeyboardButton("💧 በእቅዱ መሰረት ጠጥቻለሁ", callback_data="log_second_hit")], [InlineKeyboardButton("❌ አልሞላሁም / Missed", callback_data="log_second_miss")]]
             text = "💧 <b>የውኃ ክትትል / HYDRATION CHECK</b>\nበእቅዱ መሰረት ውኃ ጠጥተዋል? / Did you drink water according to your plan?"
         await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
@@ -934,7 +1054,6 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
                         parse_mode="HTML"
                     )
 
-                    # Route check-in note to admin chat
                     for a_id in ADMIN_USER_IDS:
                         await send_message_safely(
                             context, chat_id=a_id,
@@ -1018,6 +1137,11 @@ async def handle_admin_tier_approval(update: Update, context: ContextTypes.DEFAU
 # INITIALIZATION & SCHEDULERS
 # ------------------------------------------------------------------
 async def post_init(application):
+    await application.bot.set_my_commands([
+        BotCommand("start", "Open Main Menu / ዋና መናኸሪያ"),
+        BotCommand("checkin", "Do Daily Check-In / የዕለት ክትትል"),
+        BotCommand("profile", "View Profile / መለያዬ")
+    ])
     await start_web_server()
     scheduler = AsyncIOScheduler()
     scheduler.add_job(send_morning_motivation, "cron", hour=8, minute=0, timezone=EAT_TIMEZONE, args=[application])
@@ -1050,6 +1174,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_upgrade_payment_info, pattern="^upgrade_"))
     app.add_handler(CallbackQueryHandler(handle_admin_tier_approval, pattern="^approve_tier_"))
 
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_keyboard))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_client_attachments))
 
     app.add_error_handler(error_handler)
