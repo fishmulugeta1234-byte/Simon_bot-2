@@ -637,6 +637,75 @@ async def admin_view_questions(update: Update, context: ContextTypes.DEFAULT_TYP
         logging.error(f"Error fetching client questions: {e}")
         await update.message.reply_text(f"⚠️ Failed to fetch questions: {e}")
 
+async def admin_view_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /media [photo|voice] [limit]
+    Lists the most recent saved client photos or voice notes, resolved to
+    the client's name, and renders each one inline (mirrors /questions,
+    which only covers media_type == 'text')."""
+    if update.effective_user.id not in ADMIN_USER_IDS:
+        return
+
+    media_type = "photo"
+    limit = 10
+    args = context.args or []
+    if len(args) >= 1:
+        if args[0].lower() in ("photo", "voice"):
+            media_type = args[0].lower()
+            if len(args) >= 2:
+                try:
+                    limit = max(1, min(20, int(args[1])))
+                except ValueError:
+                    pass
+        else:
+            try:
+                limit = max(1, min(20, int(args[0])))
+            except ValueError:
+                pass
+
+    try:
+        res = (
+            supabase.table("client_media")
+            .select("client_id, telegram_file_id, message_text, created_at")
+            .eq("media_type", media_type)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            await update.message.reply_text(f"📭 No saved {media_type} messages found.")
+            return
+
+        client_ids = list({r["client_id"] for r in rows})
+        names_res = supabase.table("clients").select("id, full_name").in_("id", client_ids).execute()
+        name_map = {c["id"]: c.get("full_name", "Unknown") for c in (names_res.data or [])}
+
+        icon = "📸" if media_type == "photo" else "🎙️"
+        await update.message.reply_text(f"{icon} <b>RECENT CLIENT {media_type.upper()}S (last {len(rows)})</b>", parse_mode="HTML")
+
+        for r in rows:
+            name = esc(name_map.get(r["client_id"], "Unknown"))
+            when = ""
+            try:
+                when = parse_supabase_timestamp(r["created_at"]).astimezone(EAT_TIMEZONE).strftime("%b %d, %I:%M %p")
+            except Exception:
+                pass
+            caption = f"{icon} <b>{name}</b> (<code>{r['client_id']}</code>){' — ' + when if when else ''}"
+            if r.get("message_text"):
+                caption += f"\n<i>{esc(r['message_text'])}</i>"
+
+            try:
+                if media_type == "photo":
+                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=r["telegram_file_id"], caption=caption, parse_mode="HTML")
+                else:
+                    await context.bot.send_voice(chat_id=update.effective_chat.id, voice=r["telegram_file_id"], caption=caption, parse_mode="HTML")
+            except Exception as send_err:
+                logging.error(f"Failed to render {media_type} row for admin: {send_err}")
+                await update.message.reply_text(caption, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Error fetching client media: {e}")
+        await update.message.reply_text(f"⚠️ Failed to fetch media: {e}")
+
 async def admin_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS:
         return
@@ -1197,14 +1266,21 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
             return
 
     try:
-        c = supabase.table("clients").select("package, full_name").eq("id", u.id).execute().data[0]
+        c = supabase.table("clients").select("package, full_name, plan_ready").eq("id", u.id).execute().data[0]
         tier = c.get("package", "Meal Plan Only (2 Months)")
-    except Exception: tier = "Meal Plan Only (2 Months)"
+        plan_ready = c.get("plan_ready", True)
+    except Exception:
+        tier = "Meal Plan Only (2 Months)"
+        plan_ready = True
 
     perms = TIER_PERMISSIONS.get(tier, TIER_PERMISSIONS["Meal Plan Only (2 Months)"])
 
+    # FIX: while a client's plan is still being built (plan_ready is False),
+    # they're usually still on the default restricted tier and can't yet
+    # upgrade — but the /start intake question explicitly asks them to reply
+    # with a text or voice note. Don't let the tier gate block that reply.
     if update.message.photo or update.message.video or update.message.voice:
-        if not perms["allow_media"] and not update.message.photo:
+        if plan_ready and not perms["allow_media"] and not update.message.photo:
             await update.message.reply_text("ማሳሰቢያ፦ የፎርም ግምገማዎች እና የድምጽ መልእክቶች ለ Transformation ፓኬጆች ብቻ የተሰጡ ናቸው። ለማሻሻል ከታች ይጫኑ:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏋️ Upgrade Plan", callback_data="upgrade_tier")]]))
             return
 
@@ -1228,7 +1304,7 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
         return
 
     if update.message.text:
-        if not perms["allow_qa"]:
+        if plan_ready and not perms["allow_qa"]:
             await update.message.reply_text("ጥያቄዎችን በቀጥታ የመጠየቅ መብት ለኮቺንግ ፓኬጅ ተጠቃሚዎች ብቻ የተሰጡ ናቸው። ለማሻሻል ከታች ይጫኑ:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏋️ Upgrade Plan", callback_data="upgrade_tier")]]))
             return
 
@@ -1291,8 +1367,10 @@ def main():
     app.add_handler(CommandHandler("status", admin_status_command))
     app.add_handler(CommandHandler("sendfile", admin_send_file))
     app.add_handler(CommandHandler("questions", admin_view_questions))
+    app.add_handler(CommandHandler("media", admin_view_media))
     app.add_handler(CommandHandler("testmotivation", admin_test_motivation))
     app.add_handler(CommandHandler("testnudge", admin_test_nudge))
+    app.add_handler(CommandHandler("testjob", admin_test_scheduled_job))
 
     app.add_handler(CallbackQueryHandler(handle_target_plan, pattern="^get_target_plan$"))
     app.add_handler(CallbackQueryHandler(handle_client_profile, pattern="^get_client_profile$"))
