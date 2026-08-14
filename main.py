@@ -87,6 +87,84 @@ TIER_CODES_REVERSE = {v: k for k, v in TIER_CODES.items()}
 CHECKIN_LOCKS = defaultdict(asyncio.Lock)
 
 # ------------------------------------------------------------------
+# MORNING MOTIVATION MESSAGE POOL (bilingual AM/EN, goal-aware, rotating)
+# ------------------------------------------------------------------
+def _streak_line(streak: int) -> str:
+    if streak <= 0:
+        return "\n\n🎬 <i>Start your streak today! / ዛሬ Streak ጀምር!</i>"
+    elif streak == 1:
+        return f"\n\n🔥 <b>Day {streak}</b> — the streak has begun! / <b>{streak}ኛ ቀን</b> — Streak ጀምሯል!"
+    else:
+        return f"\n\n🔥 <b>{streak}-day streak</b> and counting! / <b>{streak} ቀናት</b> ተከታታይ ክትትል!"
+
+MOTIVATION_VARIANTS = {
+    "fat_loss": [
+        lambda streak: (
+            "☀️ <b>Main Character Energy! / አዲስ ቀን፣ አዲስ ሌቭል!</b>\n\n"
+            "ዛሬ ቀኑን በድል እንወጣዋለን! ሌቭል-አፕ ለማድረግ ዛሬም በጉልበትና በቁርጠኝነት እንነሳ! 🎮🔥\n\n"
+            "<i>New day, new lobby! Time to level up and crush today's quest.</i>"
+            + _streak_line(streak)
+        ),
+        lambda streak: (
+            "🏃 <b>Warm-Up Complete, Let's Go! / እንሂድ!</b>\n\n"
+            "ሰውነትዎ ዝግጁ ነው፣ አእምሮዎም ዝግጁ ነው። ዛሬ የካሎሪ ግቦትን በርትተው ይምቱ! 💪🔥\n\n"
+            "<i>Your body's ready, your mind's ready. Go hit today's calorie target with intent.</i>"
+            + _streak_line(streak)
+        ),
+        lambda streak: (
+            "🎯 <b>ተግሣጽ ከተነሳሽነት ይበልጣል! / Discipline Beats Motivation!</b>\n\n"
+            "የስሜት ሁኔታ ይለዋወጣል፣ ልማድ ግን አይለወጥም። ዛሬ በእቅድዎ ይቀጥሉ! ✨\n\n"
+            "<i>Motivation comes and goes — discipline shows up anyway. Stick to the plan today.</i>"
+            + _streak_line(streak)
+        ),
+        lambda streak: (
+            "🌅 <b>አንድ እርምጃ ወደ ግብዎ! / One Step Closer!</b>\n\n"
+            "የተለወጠ ሰውነት በአንድ ቀን አይገነባም፣ ግን ዛሬ ያደረጉት ምርጫ ወደዚያ ያደርስዎታል። 🚀\n\n"
+            "<i>The transformation isn't built in one day — but today's choices get you there.</i>"
+            + _streak_line(streak)
+        ),
+        lambda streak: (
+            "⚡ <b>አዲስ ቀን፣ ንጹህ ገጽ! / Fresh Page, New Day!</b>\n\n"
+            "ትናንት ትናንት ነው። ዛሬ ደግሞ ራስዎን ለማሻሻል አዲስ ዕድል ነው! ☀️\n\n"
+            "<i>Yesterday's done. Today's a clean page to build on.</i>"
+            + _streak_line(streak)
+        ),
+    ],
+    "muscle": [
+        lambda streak: (
+            "🎮 <b>Level Up Time! / ጊዜው ደርሷል!</b>\n\n"
+            "ዛሬ ጡንቻ ለመገንባት እና ፕሮቲንዎን ለመምታት ጊዜው ነው! XP እያገኙ ነው! 💪🔥\n\n"
+            "<i>Time to grind — hit your protein, build that muscle, earn today's XP.</i>"
+            + _streak_line(streak)
+        ),
+        lambda streak: (
+            "🏋️ <b>ብረት ይጠራል! / The Iron is Calling!</b>\n\n"
+            "እያንዳንዱ ስብስብ (rep) ወደ ግብዎ ያቀርብዎታል። ዛሬ በጥንካሬ ይስሩ! 🔥\n\n"
+            "<i>Every rep gets you closer. Go put in work today.</i>"
+            + _streak_line(streak)
+        ),
+        lambda streak: (
+            "🌱 <b>እድገት ጊዜ ይፈልጋል! / Growth Takes Time!</b>\n\n"
+            "ጡንቻ የሚገነባው በጅምናዚየም ውስጥ ብቻ ሳይሆን በኩሽናዎም ውስጥ ጭምር ነው። ካሎሪ እና ፕሮቲንዎን ይምቱ! 💪\n\n"
+            "<i>Muscle is built in the kitchen as much as the gym — hit your calories and protein today.</i>"
+            + _streak_line(streak)
+        ),
+        lambda streak: (
+            "⚙️ <b>ጥንካሬ ይገንቡ፣ ቀን በቀን! / Build Strength, Day by Day!</b>\n\n"
+            "ትንንሽ ወጥነት ያላቸው ጥረቶች ትልቅ ውጤት ያመጣሉ። ዛሬ ወጥ ይሁኑ! ✨\n\n"
+            "<i>Small consistent effort compounds into real strength. Stay consistent today.</i>"
+            + _streak_line(streak)
+        ),
+        lambda streak: (
+            "⚡ <b>አዲስ ቀን፣ አዲስ ስብስብ! / New Day, New Gains!</b>\n\n"
+            "ትናንት ያለፈ ነው። ዛሬ ጡንቻ ለመገንባት አዲስ ዕድል ነው! 🚀\n\n"
+            "<i>Yesterday's in the books. Today's a fresh shot at building.</i>"
+            + _streak_line(streak)
+        ),
+    ],
+}
+
+# ------------------------------------------------------------------
 # DUMMY WEB SERVER (Keeps Render Health Checks Active)
 # ------------------------------------------------------------------
 async def health_check(request):
@@ -169,22 +247,35 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # BACKGROUND JOBS: MOTIVATION & REMINDERS
 # ------------------------------------------------------------------
 async def send_morning_motivation(context: ContextTypes.DEFAULT_TYPE):
-    """Runs at 8:00 AM EAT"""
+    """Runs at 8:00 AM EAT. Rotates through a bilingual message pool, picked
+    per-client by their goal (fat loss vs muscle) and personalized with
+    their current check-in streak."""
     try:
-        res = supabase.table("clients").select("id, package").eq("is_active", True).execute()
+        res = supabase.table("clients").select("id, package, goal").eq("is_active", True).execute()
         if not res.data:
             return
 
         clients = [c for c in res.data if "Meal Plan Only" not in (c.get("package") or "")]
         if not clients:
             return
-        text = (
-            "☀️ <b>Main Character Energy! / አዲስ ቀን፣ አዲስ ሌቭል!</b>\n\n"
-            "ዛሬ ቀኑን በድል እንወጣዋለን! ሌቭል-አፕ ለማድረግ ዛሬም በጉልበትና በቁርጠኝነት እንነሳ! 🎮🔥\n\n"
-            "<i>New day, new lobby! Time to level up and crush today's quest.</i>"
-        )
+
+        seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        logs_res = supabase.table("daily_logs").select("client_id, created_at").in_("client_id", [c["id"] for c in clients]).gte("created_at", seven_days_ago).execute()
+
+        logs_by_client = defaultdict(set)
+        for log in (logs_res.data or []):
+            logs_by_client[log["client_id"]].add(parse_supabase_timestamp(log["created_at"]).date())
+
+        # Same variant for everyone on a given goal each day, rotating daily.
+        day_index = datetime.now(EAT_TIMEZONE).timetuple().tm_yday
 
         for client in clients:
+            goal_key = "muscle" if client.get("goal") == "goal_muscle" else "fat_loss"
+            variants = MOTIVATION_VARIANTS[goal_key]
+            template = variants[day_index % len(variants)]
+            streak = len(logs_by_client.get(client["id"], set()))
+            text = template(streak)
+
             await send_message_safely(context, chat_id=client["id"], text=text, parse_mode="HTML")
             await asyncio.sleep(0.05)
     except Exception as e:
@@ -576,6 +667,68 @@ async def admin_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Document successfully delivered to client `{c_id}`!", parse_mode="HTML")
     else:
         await update.message.reply_text(f"❌ Failed to send document. Check if the client ID is correct or if they blocked the bot.")
+
+async def admin_test_motivation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually fires the 8:00 AM morning motivation job right now, so you
+    don't have to wait for the scheduler. Sends to all active, non-Meal-Plan
+    clients exactly as the real job would."""
+    if update.effective_user.id not in ADMIN_USER_IDS:
+        return
+    await update.message.reply_text("🧪 Running morning motivation job now...")
+    try:
+        await send_morning_motivation(context)
+        await update.message.reply_text("✅ Done. Check the logs above for who received it.")
+    except Exception as e:
+        logging.error(f"Manual motivation test failed: {e}")
+        await update.message.reply_text(f"⚠️ Test failed: {e}")
+
+async def admin_test_nudge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually fires the 8:00 PM evening check-in nudge right now. Only
+    reaches clients who haven't logged today, exactly like the real job —
+    so if you already checked in as a test client, you won't get it."""
+    if update.effective_user.id not in ADMIN_USER_IDS:
+        return
+    await update.message.reply_text("🧪 Running evening check-in nudge job now (skips anyone already checked in today)...")
+    try:
+        await send_daily_checkin_reminders(context)
+        await update.message.reply_text("✅ Done.")
+    except Exception as e:
+        logging.error(f"Manual nudge test failed: {e}")
+        await update.message.reply_text(f"⚠️ Test failed: {e}")
+
+async def admin_test_scheduled_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually fires one of the scheduled broadcast jobs right now, so you
+    don't have to wait for its cron time to see what it sends.
+    Usage: /testjob <morning|evening|latenight|sunday|expirations>"""
+    if update.effective_user.id not in ADMIN_USER_IDS:
+        return
+
+    jobs = {
+        "morning": send_morning_motivation,
+        "evening": send_daily_checkin_reminders,
+        "latenight": send_late_night_reminders,
+        "sunday": send_sunday_admin_report,
+        "expirations": check_expirations_and_streaks,
+    }
+
+    if not context.args or context.args[0].lower() not in jobs:
+        await update.message.reply_text(
+            f"⚠️ Usage: `/testjob <name>`\nAvailable: {', '.join(jobs.keys())}\n\n"
+            "This runs the real job right now, against real client data — it will "
+            "actually message clients (e.g. anyone not yet checked in today gets a "
+            "reminder). Use with that in mind.",
+            parse_mode="HTML"
+        )
+        return
+
+    job_name = context.args[0].lower()
+    msg = await update.message.reply_text(f"🧪 Running `{job_name}` job now...", parse_mode="HTML")
+    try:
+        await jobs[job_name](context)
+        await msg.edit_text(f"✅ `{job_name}` job finished. Check the relevant chats.", parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Manual job trigger '{job_name}' failed: {e}")
+        await msg.edit_text(f"⚠️ `{job_name}` job failed: {e}", parse_mode="HTML")
 
 # ------------------------------------------------------------------
 # CLIENT COMMANDS & VIEWS (WITH GATEKEEPER CHECK)
@@ -1138,6 +1291,8 @@ def main():
     app.add_handler(CommandHandler("status", admin_status_command))
     app.add_handler(CommandHandler("sendfile", admin_send_file))
     app.add_handler(CommandHandler("questions", admin_view_questions))
+    app.add_handler(CommandHandler("testmotivation", admin_test_motivation))
+    app.add_handler(CommandHandler("testnudge", admin_test_nudge))
 
     app.add_handler(CallbackQueryHandler(handle_target_plan, pattern="^get_target_plan$"))
     app.add_handler(CallbackQueryHandler(handle_client_profile, pattern="^get_client_profile$"))
