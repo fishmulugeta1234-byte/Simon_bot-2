@@ -493,16 +493,24 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS:
         return
 
-    doc = update.message.document or (
-        update.message.reply_to_message.document if update.message.reply_to_message else None
-    )
+    reply = update.message.reply_to_message
 
-    if len(context.args) < 2 or not doc:
+    if len(context.args) < 2 or not reply:
         await update.message.reply_text(
-            "⚠️ Usage: Send the file first (no caption), then reply to it with "
-            "`/sendplan [client_id] [meal|workout]`",
+            "⚠️ Usage: Reply to a file/photo with `/sendplan [client_id] [meal|workout]`",
             parse_mode="HTML"
         )
+        return
+        
+    file_id = None
+    if reply.document:
+        file_id = reply.document.file_id
+    elif reply.photo:
+        file_id = reply.photo[-1].file_id
+    elif reply.video:
+        file_id = reply.video.file_id
+    else:
+        await update.message.reply_text("❌ Replied message contains no valid file or photo.")
         return
 
     try:
@@ -517,7 +525,6 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     col = "meal_plan_url" if p_type == "meal" else "workout_plan_url"
-    file_id = doc.file_id
 
     try:
         supabase.table("clients").update({
@@ -710,32 +717,38 @@ async def admin_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS:
         return
 
-    doc = update.message.document or (
-        update.message.reply_to_message.document if update.message.reply_to_message else None
-    )
-
-    if not context.args or not doc:
+    reply = update.message.reply_to_message
+    if not context.args or not reply:
         await update.message.reply_text(
-            "⚠️ Usage: Send the file first (no caption), then reply to it with `/sendfile [client_id]`",
+            "⚠️ Usage: Reply to any media or file with `/sendfile [client_id]`",
             parse_mode="HTML"
         )
         return
 
-    c_id = context.args[0]
-    file_id = doc.file_id
+    try:
+        c_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Error: Client ID must be a valid number.")
+        return
+
     caption = update.message.caption or "📁 <b>ከሳይመን የተላከ ተጨማሪ ሰነድ / Additional Document from Coach</b>"
 
-    success = await send_message_safely(
-        context, chat_id=int(c_id),
-        document=file_id,
-        caption=caption,
-        parse_mode="HTML"
-    )
+    try:
+        if reply.document:
+            await context.bot.send_document(chat_id=c_id, document=reply.document.file_id, caption=caption, parse_mode="HTML")
+        elif reply.photo:
+            await context.bot.send_photo(chat_id=c_id, photo=reply.photo[-1].file_id, caption=caption, parse_mode="HTML")
+        elif reply.video:
+            await context.bot.send_video(chat_id=c_id, video=reply.video.file_id, caption=caption, parse_mode="HTML")
+        else:
+            await update.message.reply_text("❌ Replied message contains no valid file, photo, or video.")
+            return
 
-    if success:
-        await update.message.reply_text(f"✅ Document successfully delivered to client `{c_id}`!", parse_mode="HTML")
-    else:
-        await update.message.reply_text(f"❌ Failed to send document. Check if the client ID is correct or if they blocked the bot.")
+        await update.message.reply_text(f"✅ Attachment successfully delivered to client `{c_id}`!", parse_mode="HTML")
+    except Forbidden:
+        await update.message.reply_text(f"❌ Failed: Client `{c_id}` has blocked the bot.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to send: {e}")
 
 async def admin_test_motivation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manually fires the 8:00 AM morning motivation job right now, so you
@@ -1266,12 +1279,17 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
             return
 
     try:
-        c = supabase.table("clients").select("package, full_name, plan_ready").eq("id", u.id).execute().data[0]
-        tier = c.get("package", "Meal Plan Only (2 Months)")
-        plan_ready = c.get("plan_ready", True)
+        res = supabase.table("clients").select("package, full_name, plan_ready").eq("id", u.id).execute()
+        if res.data:
+            c = res.data[0]
+            tier = c.get("package", "Meal Plan Only (2 Months)")
+            plan_ready = c.get("plan_ready", True)
+        else:
+            tier = "Meal Plan Only (2 Months)"
+            plan_ready = False
     except Exception:
         tier = "Meal Plan Only (2 Months)"
-        plan_ready = True
+        plan_ready = False
 
     perms = TIER_PERMISSIONS.get(tier, TIER_PERMISSIONS["Meal Plan Only (2 Months)"])
 
