@@ -5,6 +5,7 @@ import asyncio
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Forbidden
@@ -91,11 +92,12 @@ CHECKIN_LOCKS = defaultdict(asyncio.Lock)
 # ------------------------------------------------------------------
 def _streak_line(streak: int) -> str:
     if streak <= 0:
-        return "\n\n🎬 <i>Start your streak today! / ዛሬ Streak ጀምር!</i>"
+        return "\n\n🎬 <i>Start your streak today! / ዛሬ ተከታታይ ቀኖችዎን ይጀምሩ!</i>"
     elif streak == 1:
-        return f"\n\n🔥 <b>Day {streak}</b> — the streak has begun! / <b>{streak}ኛ ቀን</b> — Streak ጀምሯል!"
+        return f"\n\n🔥 <b>Day {streak}</b> — the streak has begun! / <b>{streak}ኛ ቀን</b> — ጅምርዎ ጥሩ ነው!"
     else:
-        return f"\n\n🔥 <b>{streak}-day streak</b> and counting! / <b>{streak} ቀናት</b> ተከታታይ ክትትል!"
+        return f"\n\n🔥 <b>{streak}-day streak</b> and counting! / <b>{streak} ተከታታይ ቀናት</b> እያስመዘገቡ ነው!"
+
 
 MOTIVATION_VARIANTS = {
     "fat_loss": [
@@ -112,7 +114,7 @@ MOTIVATION_VARIANTS = {
             + _streak_line(streak)
         ),
         lambda streak: (
-            "🎯 <b>ተግሣጽ ከተነሳሽነት ይበልጣል! / Discipline Beats Motivation!</b>\n\n"
+            "🎯 <b>ጽናት ከተነሳሽነት ይበልጣል! / Discipline Beats Motivation!</b>\n\n"
             "የስሜት ሁኔታ ይለዋወጣል፣ ልማድ ግን አይለወጥም። ዛሬ በእቅድዎ ይቀጥሉ! ✨\n\n"
             "<i>Motivation comes and goes — discipline shows up anyway. Stick to the plan today.</i>"
             + _streak_line(streak)
@@ -170,6 +172,7 @@ MOTIVATION_VARIANTS = {
 async def health_check(request):
     return web.Response(text="Server listening on port 8080 & Bot polling started.")
 
+
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", health_check)
@@ -180,6 +183,7 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
+
 # ------------------------------------------------------------------
 # HELPERS
 # ------------------------------------------------------------------
@@ -187,6 +191,7 @@ def esc(value) -> str:
     if value is None:
         return ""
     return html.escape(str(value))
+
 
 async def get_client_language(user_id: int) -> str:
     try:
@@ -197,6 +202,7 @@ async def get_client_language(user_id: int) -> str:
         pass
     return "am"
 
+
 def parse_supabase_timestamp(ts: str) -> datetime:
     normalized = ts.replace("Z", "+00:00")
     dt = datetime.fromisoformat(normalized)
@@ -204,10 +210,12 @@ def parse_supabase_timestamp(ts: str) -> datetime:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
+
 def get_today_start_utc() -> str:
     now_eat = datetime.now(EAT_TIMEZONE)
     start_eat = now_eat.replace(hour=0, minute=0, second=0, microsecond=0)
     return start_eat.astimezone(timezone.utc).isoformat()
+
 
 async def send_message_safely(context: ContextTypes.DEFAULT_TYPE, chat_id: int, **kwargs) -> bool:
     try:
@@ -223,6 +231,7 @@ async def send_message_safely(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
     except Exception as err:
         logging.error(f"Failed to send message to {chat_id}: {err}")
         return False
+
 
 # ------------------------------------------------------------------
 # GLOBAL ERROR HANDLER
@@ -242,6 +251,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
                 pass
     except Exception:
         pass
+
 
 # ------------------------------------------------------------------
 # BACKGROUND JOBS: MOTIVATION & REMINDERS
@@ -281,6 +291,7 @@ async def send_morning_motivation(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Error sending morning motivation: {e}")
 
+
 async def send_daily_checkin_reminders(context: ContextTypes.DEFAULT_TYPE):
     """Runs at 8:00 PM EAT"""
     try:
@@ -315,6 +326,7 @@ async def send_daily_checkin_reminders(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Error sending evening reminders: {e}")
 
+
 async def send_late_night_reminders(context: ContextTypes.DEFAULT_TYPE):
     """Runs at 10:30 PM EAT"""
     try:
@@ -347,6 +359,7 @@ async def send_late_night_reminders(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Error sending late night reminders: {e}")
 
+
 async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
     try:
         res = supabase.table("clients").select("id, full_name, package, goal").eq("is_active", True).execute()
@@ -373,6 +386,7 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Error generating Sunday report: {e}")
 
+
 async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
     try:
         res = supabase.table("clients").select("id, package, created_at, package_started_at, renewal_notified, testimonial_notified").eq("is_active", True).execute()
@@ -381,7 +395,13 @@ async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
 
         for client in res.data:
             c_id = client["id"]
-            pkg = client.get("package", "Meal Plan Only (2 Months)")
+            # FIX: .get("package", default) only falls back when the KEY is
+            # missing, not when the value is NULL. A client row with
+            # package IS NULL made pkg = None here, and the membership
+            # check below ("Meal Plan Only" in pkg) raised a TypeError that
+            # aborted this whole try block — silently skipping every
+            # remaining client in the loop for renewal/testimonial checks.
+            pkg = client.get("package") or "Meal Plan Only (2 Months)"
             cycle_start_raw = client.get("package_started_at") or client["created_at"]
             days_active = (now - parse_supabase_timestamp(cycle_start_raw)).days
 
@@ -416,6 +436,7 @@ async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Error checking expirations: {e}")
 
+
 # ------------------------------------------------------------------
 # ADMIN COMMANDS
 # ------------------------------------------------------------------
@@ -438,6 +459,7 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(0.05)
 
     await msg.edit_text(f"✅ Delivered to {count} active clients.")
+
 
 async def admin_set_package(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS: return
@@ -464,6 +486,7 @@ async def admin_set_package(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"⚠️ Failed: {e}")
 
+
 async def admin_client_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS: return
     if not context.args: return
@@ -489,6 +512,7 @@ async def admin_client_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error: {e}")
 
+
 async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS:
         return
@@ -501,7 +525,7 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
         return
-        
+
     file_id = None
     if reply.document:
         file_id = reply.document.file_id
@@ -543,6 +567,7 @@ async def admin_send_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Failed to update plan in Supabase for client {c_id}: {e}")
         await update.message.reply_text(f"⚠️ Database Failed: {e}")
 
+
 async def admin_send_voice_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS: return
 
@@ -569,12 +594,13 @@ async def admin_send_voice_feedback(update: Update, context: ContextTypes.DEFAUL
     except Exception as e:
         await update.message.reply_text(f"⚠️ Failed: {e}")
 
+
 async def admin_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS:
         return
 
     try:
-        res = supabase.table("clients").select("full_name, package, is_active, plan_ready, created_at").order("created_at", desc=True).execute()
+        res = supabase.table("clients").select("id, full_name, package, is_active, plan_ready, created_at").order("created_at", desc=True).execute()
         clients = res.data or []
 
         total = len(clients)
@@ -592,13 +618,15 @@ async def admin_status_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
         for client in clients[:5]:
             name = esc(client.get("full_name", "Unknown"))
+            c_id = client.get("id", "?")
             pkg = esc(client.get("package", "Standard"))
             status = "🟢" if client.get("is_active") else "🔴"
-            text += f"• {status} {name} | <i>{pkg}</i>\n"
+            text += f"• {status} {name} (<code>{c_id}</code>) | <i>{pkg}</i>\n"
 
         await update.message.reply_text(text, parse_mode="HTML")
     except Exception as e:
         await update.message.reply_text(f"⚠️ Failed to fetch status: {e}")
+
 
 async def admin_view_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS:
@@ -643,6 +671,7 @@ async def admin_view_questions(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         logging.error(f"Error fetching client questions: {e}")
         await update.message.reply_text(f"⚠️ Failed to fetch questions: {e}")
+
 
 async def admin_view_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Usage: /media [photo|voice] [limit]
@@ -713,6 +742,7 @@ async def admin_view_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error fetching client media: {e}")
         await update.message.reply_text(f"⚠️ Failed to fetch media: {e}")
 
+
 async def admin_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS:
         return
@@ -750,6 +780,7 @@ async def admin_send_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to send: {e}")
 
+
 async def admin_test_motivation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manually fires the 8:00 AM morning motivation job right now, so you
     don't have to wait for the scheduler. Sends to all active, non-Meal-Plan
@@ -764,6 +795,7 @@ async def admin_test_motivation(update: Update, context: ContextTypes.DEFAULT_TY
         logging.error(f"Manual motivation test failed: {e}")
         await update.message.reply_text(f"⚠️ Test failed: {e}")
 
+
 async def admin_test_nudge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manually fires the 8:00 PM evening check-in nudge right now. Only
     reaches clients who haven't logged today, exactly like the real job —
@@ -777,6 +809,7 @@ async def admin_test_nudge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Manual nudge test failed: {e}")
         await update.message.reply_text(f"⚠️ Test failed: {e}")
+
 
 async def admin_test_scheduled_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manually fires one of the scheduled broadcast jobs right now, so you
@@ -812,6 +845,7 @@ async def admin_test_scheduled_job(update: Update, context: ContextTypes.DEFAULT
         logging.error(f"Manual job trigger '{job_name}' failed: {e}")
         await msg.edit_text(f"⚠️ `{job_name}` job failed: {e}", parse_mode="HTML")
 
+
 # ------------------------------------------------------------------
 # CLIENT COMMANDS & VIEWS (WITH GATEKEEPER CHECK)
 # ------------------------------------------------------------------
@@ -833,6 +867,7 @@ async def get_main_menu_markup(user_id: int):
             [InlineKeyboardButton("🔄 ፓኬጅ ማሻሻያ / Upgrade Package", callback_data="upgrade_tier")],
             [InlineKeyboardButton("🌐 ወደ እንግሊዝኛ ቀይር (Switch to English)", callback_data="set_lang_en")]
         ])
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -877,11 +912,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     markup = await get_main_menu_markup(user_id)
     await update.message.reply_text(
-        "እንኳን ወደ ሲሞን ኦሪጅን የክትትል እና ኮቺንግ ፖርታል በደህና መጡ! 🎯\n"
+        "እንኳን ወደ ሳይመን ኦሪጅን የክትትል እና ኮቺንግ ፖርታል በደህና መጡ! 🎯\n"
         "Welcome to Simon Origin Tracking & Coaching Portal! 🎯\n\n"
         "ቋንቋ ለመቀየር ወይም ለመጀመር ከታች ያሉትን ይጫኑ / Select an option below:",
         reply_markup=markup,
     )
+
 
 async def checkin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /checkin text command by opening the daily check-in flow."""
@@ -893,7 +929,7 @@ async def checkin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         today_start = get_today_start_utc()
         if supabase.table("daily_logs").select("id").eq("client_id", user.id).gte("created_at", today_start).execute().data:
             await update.message.reply_text(
-                "✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nአስደናቂ ወጥነት! Streak እንዳይቋረጥ ነገ ይመለሱ! 🔥",
+                "✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nአስደናቂ ወጥነት! ተከታታይነትዎ እንዳይቋረጥ ነገ ይመለሱ! 🔥",
                 parse_mode="HTML"
             )
             return
@@ -921,6 +957,7 @@ async def checkin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     except Exception as err:
         logging.error(f"Failed to send checkin prompt to {user.id}: {err}")
+
 
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /profile text command to display client details."""
@@ -970,6 +1007,7 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error loading profile for {user.id}: {e}")
         await update.message.reply_text("⚠️ Error loading profile.")
 
+
 async def handle_language_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -980,7 +1018,8 @@ async def handle_language_switch(update: Update, context: ContextTypes.DEFAULT_T
 
     markup = await get_main_menu_markup(query.from_user.id)
     text = "Language switched to English! 🇬🇧" if new_lang == "en" else "ቋንቋ ወደ አማርኛ ተቀይሯል! 🇪🇹"
-    await query.message.edit_text(f"✅ <b>{text}</b>\n\nእንኳን ወደ ሲሞን ኦሪጅን ፖርታል በደህና መጡ! ከታች ይምረጡ:", reply_markup=markup, parse_mode="HTML")
+    await query.message.edit_text(f"✅ <b>{text}</b>\n\nእንኳን ወደ ሳይመን ኦሪጅን ፖርታል በደህና መጡ! ከታች ይምረጡ:", reply_markup=markup, parse_mode="HTML")
+
 
 async def handle_client_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1006,6 +1045,7 @@ async def handle_client_profile(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         await query.message.reply_text("⚠️ Error loading profile.")
 
+
 async def handle_target_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1030,6 +1070,7 @@ async def handle_target_plan(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await query.message.reply_text("🏋️ Workout Plan: Not Uploaded Yet" if lang == "en" else "🏋️ የአካል ብቃት እቅድ፦ እስካሁን አልተጫነም")
     except Exception:
         await query.message.reply_text("⚠️ Error fetching plans.")
+
 
 # ------------------------------------------------------------------
 # UPGRADE & PAYMENT FLOW (WITH ERROR SAFETY & DYNAMIC CURRENCY)
@@ -1088,6 +1129,7 @@ async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as err:
         logging.error(f"Failed to render upgrade menu for {u_id}: {err}")
 
+
 async def handle_upgrade_payment_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1130,6 +1172,7 @@ async def handle_upgrade_payment_info(update: Update, context: ContextTypes.DEFA
 
     await query.message.reply_text(text, parse_mode="HTML")
 
+
 # ------------------------------------------------------------------
 # DAILY CHECK-IN FLOW (WITH TEXT INPUT FOR CLIENTS)
 # ------------------------------------------------------------------
@@ -1141,7 +1184,7 @@ async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         today_start = get_today_start_utc()
         if supabase.table("daily_logs").select("id").eq("client_id", u_id).gte("created_at", today_start).execute().data:
-            await query.message.reply_text("✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nአስደናቂ ወጥነት! Streak እንዳይቋረጥ ነገ ይመለሱ! 🔥", parse_mode="HTML")
+            await query.message.reply_text("✅ <b>ዛሬ ቀድመው ተመዝግበዋል! / You've already checked in today!</b>\nአስደናቂ ወጥነት! ተከታታይነትዎ እንዳይቋረጥ ነገ ይመለሱ! 🔥", parse_mode="HTML")
             return
 
         res = supabase.table("clients").select("goal").eq("id", u_id).execute()
@@ -1161,6 +1204,7 @@ async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     except Exception as err:
         logging.error(f"Failed to send checkin prompt to {u_id}: {err}")
+
 
 async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1197,6 +1241,7 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
             parse_mode="HTML"
         )
 
+
 # ------------------------------------------------------------------
 # MEDIA, Q&A, AND APPROVALS
 # ------------------------------------------------------------------
@@ -1219,6 +1264,18 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
             context.user_data.pop("awaiting_checkin_note_started_at", None)
             context.user_data.pop("checkin_nut", None)
             context.user_data.pop("checkin_second", None)
+            # FIX: previously fell through into the generic attachment/Q&A
+            # handling below, silently discarding the nutrition/hydration
+            # answers the client already gave with no check-in row ever
+            # inserted, and no indication to the client that it didn't
+            # count. Tell them plainly and let them restart the flow.
+            await update.message.reply_text(
+                "⏱️ <b>ክትትልዎ ጊዜው አልፎበታል / Your check-in session timed out</b>\n"
+                "እባክዎ በድጋሚ ይሞክሩ፦ 'የዕለት ክትትል' ቁልፍን ይጫኑ።\n"
+                "<i>Please tap Daily Check-In again to log today's answers.</i>",
+                parse_mode="HTML"
+            )
+            return
         else:
             context.user_data["awaiting_checkin_note"] = False
             context.user_data.pop("awaiting_checkin_note_started_at", None)
@@ -1258,7 +1315,7 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
 
                     logs = supabase.table("daily_logs").select("created_at").eq("client_id", u.id).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data
                     streak = len({parse_supabase_timestamp(l["created_at"]).date() for l in logs})
-                    celeb = f"\n\n🔥 <b>ድንቅ ክንውን! / MILESTONE UNLOCKED!</b> የ <b>{streak} ቀን</b> የክትትል Streak አስመዝግበዋል!" if streak in [7,14,30] else ""
+                    celeb = f"\n\n🔥 <b>ድንቅ ክንውን! / MILESTONE UNLOCKED!</b> የ <b>{streak} ቀን</b> ተከታታይ ክትትል አስመዝግበዋል!" if streak in [7,14,30] else ""
 
                     await update.message.reply_text(
                         f"🎉 <b>ክትትልዎ እና ማስታወሻዎ ተመዝግበዋል! / Check-In Completed!</b>\n"
@@ -1335,6 +1392,7 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
         else:
             await update.message.reply_text("Question saved! 📝 ሳይመን will address this in your next check-in.", parse_mode="HTML")
 
+
 async def handle_admin_tier_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS: return
     query = update.callback_query
@@ -1358,6 +1416,7 @@ async def handle_admin_tier_approval(update: Update, context: ContextTypes.DEFAU
         await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ <b>APPROVED BY ሳይመን</b> ({tier})", parse_mode="HTML")
     except Exception: pass
 
+
 # ------------------------------------------------------------------
 # INITIALIZATION & SCHEDULERS
 # ------------------------------------------------------------------
@@ -1370,6 +1429,7 @@ async def post_init(application):
     scheduler.add_job(send_sunday_admin_report, "cron", day_of_week="sun", hour=8, minute=0, timezone=EAT_TIMEZONE, args=[application])
     scheduler.add_job(check_expirations_and_streaks, "cron", hour=9, minute=0, timezone=EAT_TIMEZONE, args=[application])
     scheduler.start()
+
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).persistence(PicklePersistence(filepath="bot_persistence")).post_init(post_init).build()
@@ -1406,6 +1466,7 @@ def main():
 
     print("⚡ Bot #2 with Gatekeeper is LIVE! Triple Motivation Schedule active.")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
