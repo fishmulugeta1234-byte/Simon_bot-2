@@ -3,7 +3,7 @@ import html
 import logging
 import asyncio
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 
 from aiohttp import web
@@ -44,6 +44,12 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Ethiopia is UTC+3 year-round (no DST), used for daily schedules
 EAT_TIMEZONE = ZoneInfo("Africa/Addis_Ababa")
 
+# How far back to look when computing a client's *current consecutive
+# streak*. This is intentionally much longer than the 7-day adherence
+# window used elsewhere, so a genuine long streak isn't artificially
+# capped at 7.
+STREAK_LOOKBACK_DAYS = 60
+
 # ------------------------------------------------------------------
 # REQUIRED SUPABASE MIGRATION (run once in the SQL editor)
 # ------------------------------------------------------------------
@@ -69,9 +75,26 @@ TIER_PERMISSIONS = {
     "Meal Plan Only (2 Months)": {"allow_media": False, "allow_qa": False, "priority": False},
     "Kickstart (21 Days)": {"allow_media": False, "allow_qa": True, "priority": False},
     "Transformation (60 Days)": {"allow_media": True, "allow_qa": True, "priority": False},
-    "Elite Transformation (90 Days)": {"allow_media": True, "allow_qa": True, "priority": True},
+    "Elite Transformation (90 Days)": {"allow_media": True, "allow_qa": True, "priority": False},
     "Lifestyle Coaching (6 Months)": {"allow_media": True, "allow_qa": True, "priority": True},
     "VIP Coaching (6 Months)": {"allow_media": True, "allow_qa": True, "priority": True},
+}
+
+# FIX: package duration attached directly to each tier name via exact-match
+# dict lookup. Previously this was an ordered chain of substring checks
+# (`"Transformation" in pkg`) which meant "Elite Transformation (90 Days)"
+# matched the "Transformation" branch (60 days) before ever reaching the
+# "Elite" branch (90 days) — Elite clients got renewal/testimonial nudges
+# a full month early. A dict keyed on the exact tier string can't be
+# shadowed like that, and safely falls back via .get(pkg, 60) for any
+# unrecognized/legacy package value.
+TIER_DURATION_DAYS = {
+    "Meal Plan Only (2 Months)": 60,
+    "Kickstart (21 Days)": 21,
+    "Transformation (60 Days)": 60,
+    "Elite Transformation (90 Days)": 90,
+    "Lifestyle Coaching (6 Months)": 180,
+    "VIP Coaching (6 Months)": 180,
 }
 
 # FIX: stable, collision-proof short codes for tier callback_data.
@@ -83,6 +106,25 @@ TIER_CODES = {
     "VIP Coaching (6 Months)": "VIP",
 }
 TIER_CODES_REVERSE = {v: k for k, v in TIER_CODES.items()}
+
+# FIX: Amharic display names for package tiers, so an Amharic-speaking
+# client doesn't see a raw English tier string dropped into the middle of
+# an otherwise fully localized profile message.
+TIER_NAMES_AM = {
+    "Meal Plan Only (2 Months)": "የምግብ እቅድ ብቻ (2 ወር)",
+    "Kickstart (21 Days)": "ኪክስታርት (21 ቀናት)",
+    "Transformation (60 Days)": "ትራንስፎርሜሽን (60 ቀናት)",
+    "Elite Transformation (90 Days)": "ኤሊት ትራንስፎርሜሽን (90 ቀናት)",
+    "Lifestyle Coaching (6 Months)": "ላይፍስታይል ኮቺንግ (6 ወር)",
+    "VIP Coaching (6 Months)": "ቪአይፒ ኮቺንግ (6 ወር)",
+}
+
+
+def display_package(pkg: str, lang: str) -> str:
+    if not pkg:
+        return pkg
+    return TIER_NAMES_AM.get(pkg, pkg) if lang == "am" else pkg
+
 
 # FIX: in-process locks to serialize the check-in flow per client.
 CHECKIN_LOCKS = defaultdict(asyncio.Lock)
@@ -211,6 +253,45 @@ def parse_supabase_timestamp(ts: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def to_eat_date(ts: str) -> date:
+    """Bucket a Supabase timestamp by its EAT calendar date, not raw UTC
+    date.
+
+    FIX: EAT is UTC+3, so a check-in made between 00:00-03:00 EAT lands on
+    the *previous* UTC calendar date when you just call .date() on the UTC
+    timestamp. That mismatched the "already checked in today?" logic
+    (which correctly uses EAT day boundaries via get_today_start_utc)
+    against the streak-bucketing logic (which was using raw UTC dates),
+    causing late-night/early-morning check-ins to be miscounted into the
+    wrong day for streak purposes.
+    """
+    return parse_supabase_timestamp(ts).astimezone(EAT_TIMEZONE).date()
+
+
+def compute_current_streak(log_dates: set, today: date) -> int:
+    """True consecutive-day streak ending today or yesterday, in EAT.
+
+    FIX: previously "streak" was just len(distinct dates in a trailing
+    7-day window) — not an actual consecutive streak. That silently
+    tolerated gaps (miss a day, resume later, and the count doesn't reset)
+    and was hard-capped at 7 even for genuinely longer streaks. This walks
+    backward day-by-day from today (or yesterday, if today's check-in
+    hasn't happened yet) and stops at the first gap.
+    """
+    if today in log_dates:
+        cursor = today
+    elif (today - timedelta(days=1)) in log_dates:
+        cursor = today - timedelta(days=1)
+    else:
+        return 0
+
+    streak = 0
+    while cursor in log_dates:
+        streak += 1
+        cursor -= timedelta(days=1)
+    return streak
+
+
 def get_today_start_utc() -> str:
     now_eat = datetime.now(EAT_TIMEZONE)
     start_eat = now_eat.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -259,7 +340,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def send_morning_motivation(context: ContextTypes.DEFAULT_TYPE):
     """Runs at 8:00 AM EAT. Rotates through a bilingual message pool, picked
     per-client by their goal (fat loss vs muscle) and personalized with
-    their current check-in streak."""
+    their current, true consecutive check-in streak."""
     try:
         res = supabase.table("clients").select("id, package, goal").eq("is_active", True).execute()
         if not res.data:
@@ -269,21 +350,22 @@ async def send_morning_motivation(context: ContextTypes.DEFAULT_TYPE):
         if not clients:
             return
 
-        seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-        logs_res = supabase.table("daily_logs").select("client_id, created_at").in_("client_id", [c["id"] for c in clients]).gte("created_at", seven_days_ago).execute()
+        lookback = (datetime.now(timezone.utc) - timedelta(days=STREAK_LOOKBACK_DAYS)).isoformat()
+        logs_res = supabase.table("daily_logs").select("client_id, created_at").in_("client_id", [c["id"] for c in clients]).gte("created_at", lookback).execute()
 
         logs_by_client = defaultdict(set)
         for log in (logs_res.data or []):
-            logs_by_client[log["client_id"]].add(parse_supabase_timestamp(log["created_at"]).date())
+            logs_by_client[log["client_id"]].add(to_eat_date(log["created_at"]))
 
         # Same variant for everyone on a given goal each day, rotating daily.
         day_index = datetime.now(EAT_TIMEZONE).timetuple().tm_yday
+        today_eat = datetime.now(EAT_TIMEZONE).date()
 
         for client in clients:
             goal_key = "muscle" if client.get("goal") == "goal_muscle" else "fat_loss"
             variants = MOTIVATION_VARIANTS[goal_key]
             template = variants[day_index % len(variants)]
-            streak = len(logs_by_client.get(client["id"], set()))
+            streak = compute_current_streak(logs_by_client.get(client["id"], set()), today_eat)
             text = template(streak)
 
             await send_message_safely(context, chat_id=client["id"], text=text, parse_mode="HTML")
@@ -372,7 +454,8 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
 
         logs_by_client = defaultdict(set)
         for log in (logs_res.data or []):
-            logs_by_client[log["client_id"]].add(parse_supabase_timestamp(log["created_at"]).date())
+            # FIX: EAT-localized date bucketing (see to_eat_date docstring).
+            logs_by_client[log["client_id"]].add(to_eat_date(log["created_at"]))
 
         report_lines = ["📥 <b>WEEKLY REVIEW QUEUE FOR SCIENTIFIC SIMON</b>\n"]
         for client in clients:
@@ -405,12 +488,13 @@ async def check_expirations_and_streaks(context: ContextTypes.DEFAULT_TYPE):
             cycle_start_raw = client.get("package_started_at") or client["created_at"]
             days_active = (now - parse_supabase_timestamp(cycle_start_raw)).days
 
-            completion_days = (
-                60 if "Meal Plan Only" in pkg else
-                (21 if "Kickstart" in pkg else
-                (60 if "Transformation" in pkg else
-                (90 if "Elite" in pkg else 180)))
-            )
+            # FIX: exact-match dict lookup instead of an ordered chain of
+            # substring checks. The old chain matched "Elite Transformation
+            # (90 Days)" against the "Transformation" branch (60 days)
+            # before ever reaching "Elite" (90 days), so Elite clients got
+            # their renewal/testimonial nudges a full month early. See
+            # TIER_DURATION_DAYS definition above.
+            completion_days = TIER_DURATION_DAYS.get(pkg, 60)
 
             if days_active >= completion_days and not client.get("testimonial_notified"):
                 testimonial_text = (
@@ -480,7 +564,7 @@ async def admin_set_package(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "testimonial_notified": False,
         }).eq("id", target_id).execute()
         lang = await get_client_language(int(target_id))
-        msg = f"🎉 <b>Package Upgraded!</b>\nYour account has been updated to <b>{tier_name}</b>." if lang == "en" else f"🎉 <b>ፓኬጅዎ ተሻሽሏል! / Package Upgraded!</b>\nመለያዎ ወደ <b>{tier_name}</b> ከፍ ብሏል። እንኳን ደስ አለዎት!"
+        msg = f"🎉 <b>Package Upgraded!</b>\nYour account has been updated to <b>{tier_name}</b>." if lang == "en" else f"🎉 <b>ፓኬጅዎ ተሻሽሏል! / Package Upgraded!</b>\nመለያዎ ወደ <b>{display_package(tier_name, lang)}</b> ከፍ ብሏል። እንኳን ደስ አለዎት!"
         await send_message_safely(context, chat_id=int(target_id), text=msg, parse_mode="HTML")
         await update.message.reply_text(f"✅ Client updated to **{tier_name}**!")
     except Exception as e:
@@ -984,11 +1068,13 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             .execute().data or []
         )
 
+        pkg_display = display_package(c.get("package"), lang)
+
         if lang == "en":
             text = (
                 f"👤 <b>YOUR COACHING PROFILE</b>\n\n"
                 f"• <b>Name:</b> {esc(c.get('full_name'))}\n"
-                f"• <b>Package:</b> {esc(c.get('package'))}\n"
+                f"• <b>Package:</b> {esc(pkg_display)}\n"
                 f"• <b>Goal:</b> {esc(c.get('goal'))}\n"
                 f"• <b>Days Active:</b> {days}\n"
                 f"• <b>7-Day Check-ins:</b> {checkins}/7\n"
@@ -997,7 +1083,7 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = (
                 f"👤 <b>የኮቺንግ መለያዎ / YOUR PROFILE</b>\n\n"
                 f"• <b>ስም:</b> {esc(c.get('full_name'))}\n"
-                f"• <b>የፓኬጅ ዓይነት:</b> {esc(c.get('package'))}\n"
+                f"• <b>የፓኬጅ ዓይነት:</b> {esc(pkg_display)}\n"
                 f"• <b>ዋና ግብ:</b> {esc(c.get('goal'))}\n"
                 f"• <b>የቆይታ ጊዜ:</b> {days} ቀናት\n"
                 f"• <b>የ7 ቀን ክትትል:</b> {checkins}/7 ቀናት\n"
@@ -1035,11 +1121,13 @@ async def handle_client_profile(update: Update, context: ContextTypes.DEFAULT_TY
         days = (datetime.now(timezone.utc) - parse_supabase_timestamp(c["created_at"])).days
         checkins = len(supabase.table("daily_logs").select("id").eq("client_id", c["id"]).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data or [])
 
+        pkg_display = display_package(c.get("package"), lang)
+
         if lang == "en":
-            text = (f"👤 <b>YOUR COACHING PROFILE</b>\n\n• <b>Name:</b> {esc(c.get('full_name'))}\n• <b>Package:</b> {esc(c.get('package'))}\n"
+            text = (f"👤 <b>YOUR COACHING PROFILE</b>\n\n• <b>Name:</b> {esc(c.get('full_name'))}\n• <b>Package:</b> {esc(pkg_display)}\n"
                     f"• <b>Goal:</b> {esc(c.get('goal'))}\n• <b>Days Active:</b> {days}\n• <b>7-Day Check-ins:</b> {checkins}/7\n")
         else:
-            text = (f"👤 <b>የኮቺንግ መለያዎ / YOUR PROFILE</b>\n\n• <b>ስም:</b> {esc(c.get('full_name'))}\n• <b>የፓኬጅ ዓይነት:</b> {esc(c.get('package'))}\n"
+            text = (f"👤 <b>የኮቺንግ መለያዎ / YOUR PROFILE</b>\n\n• <b>ስም:</b> {esc(c.get('full_name'))}\n• <b>የፓኬጅ ዓይነት:</b> {esc(pkg_display)}\n"
                     f"• <b>ዋና ግብ:</b> {esc(c.get('goal'))}\n• <b>የቆይታ ጊዜ:</b> {days} ቀናት\n• <b>የ7 ቀን ክትትል:</b> {checkins}/7 ቀናት\n")
         await query.message.reply_text(text, parse_mode="HTML")
     except Exception:
@@ -1235,11 +1323,38 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
         context.user_data["awaiting_checkin_note"] = True
         context.user_data["awaiting_checkin_note_started_at"] = datetime.now(timezone.utc).isoformat()
 
+        # FIX: added a Cancel button so a client who tapped into the flow
+        # by accident (or needs to step away) isn't stuck silently holding
+        # answered nutrition/hydration state for up to 30 minutes with no
+        # way out except waiting for the timeout.
         await query.message.reply_text(
             "✍️ <b>አጭር ማስታወሻ ወይም ጥያቄ ካለዎት ይጻፉልን (ከሌለ 'የለም' ይበሉ)፦</b>\n"
-            "<i>Drop any notes, feedback, or questions for Simon about your day:</i>",
+            "<i>Drop any notes, feedback, or questions for Simon about your day. You can also send a photo or voice note:</i>",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ይቅር / Cancel", callback_data="cancel_checkin")]]),
             parse_mode="HTML"
         )
+
+
+async def handle_cancel_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """FIX: lets a client bail out of an in-progress check-in instead of
+    being stuck in the 'awaiting note' state until the 30-minute timeout."""
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["awaiting_checkin_note"] = False
+    context.user_data.pop("awaiting_checkin_note_started_at", None)
+    context.user_data.pop("checkin_nut", None)
+    context.user_data.pop("checkin_second", None)
+
+    try:
+        await query.message.edit_text(
+            "❌ <b>ክትትሉ ተሰርዟል / Check-in cancelled</b>\n"
+            "ምንም አልተመዘገበም። ለመጀመር 'የዕለት ክትትል' ቁልፍን በማንኛውም ጊዜ ይጫኑ።\n"
+            "<i>Nothing was saved. Tap Daily Check-In anytime to start over.</i>",
+            parse_mode="HTML"
+        )
+    except Exception as err:
+        logging.error(f"Failed to edit cancel-checkin message: {err}")
 
 
 # ------------------------------------------------------------------
@@ -1279,9 +1394,45 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
         else:
             context.user_data["awaiting_checkin_note"] = False
             context.user_data.pop("awaiting_checkin_note_started_at", None)
-            note = update.message.text.strip() if update.message.text else "No note"
             nut = context.user_data.pop("checkin_nut", "Logged")
             second = context.user_data.pop("checkin_second", "Logged")
+
+            # FIX: previously only `update.message.text` was captured as the
+            # note. If a client sent a photo or voice note instead of typing
+            # (e.g. a picture of their food log, or a quick voice memo),
+            # update.message.text was None, the attachment itself was never
+            # saved anywhere, and the client just saw "Check-In Completed!"
+            # with note "No note" — their input silently vanished with no
+            # error. Now any attached photo/voice/video is saved to
+            # client_media (same as the general attachment path below) and
+            # referenced in the note, and its caption/text is used as the
+            # actual note content.
+            note_media_type = None
+            note_media_file_id = None
+            if update.message.photo:
+                note_media_type = "photo"
+                note_media_file_id = update.message.photo[-1].file_id
+            elif update.message.voice:
+                note_media_type = "voice"
+                note_media_file_id = update.message.voice.file_id
+            elif update.message.video:
+                note_media_type = "video"
+                note_media_file_id = update.message.video.file_id
+
+            if note_media_type:
+                caption_text = (update.message.caption or "").strip()
+                try:
+                    supabase.table("client_media").insert({
+                        "client_id": u.id,
+                        "media_type": note_media_type,
+                        "telegram_file_id": note_media_file_id,
+                        "message_text": caption_text,
+                    }).execute()
+                except Exception as media_err:
+                    logging.error(f"Failed to save checkin-note {note_media_type} for {u.id}: {media_err}")
+                note = f"[{note_media_type} attached]" + (f" — {caption_text}" if caption_text else "")
+            else:
+                note = update.message.text.strip() if update.message.text else "No note"
 
             async with CHECKIN_LOCKS[u.id]:
                 try:
@@ -1313,9 +1464,18 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
                         )
                         return
 
-                    logs = supabase.table("daily_logs").select("created_at").eq("client_id", u.id).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data
-                    streak = len({parse_supabase_timestamp(l["created_at"]).date() for l in logs})
-                    celeb = f"\n\n🔥 <b>ድንቅ ክንውን! / MILESTONE UNLOCKED!</b> የ <b>{streak} ቀን</b> ተከታታይ ክትትል አስመዝግበዋል!" if streak in [7,14,30] else ""
+                    # FIX: wider lookback + EAT-date bucketing + true
+                    # consecutive-streak calculation (see to_eat_date and
+                    # compute_current_streak docstrings above).
+                    logs = supabase.table("daily_logs").select("created_at").eq(
+                        "client_id", u.id
+                    ).gte(
+                        "created_at",
+                        (datetime.now(timezone.utc) - timedelta(days=STREAK_LOOKBACK_DAYS)).isoformat()
+                    ).execute().data
+                    today_eat = datetime.now(EAT_TIMEZONE).date()
+                    streak = compute_current_streak({to_eat_date(l["created_at"]) for l in (logs or [])}, today_eat)
+                    celeb = f"\n\n🔥 <b>ድንቅ ክንውን! / MILESTONE UNLOCKED!</b> የ <b>{streak} ቀን</b> ተከታታይ ክትትል አስመዝግበዋል!" if streak in [7, 14, 30, 60, 90] else ""
 
                     await update.message.reply_text(
                         f"🎉 <b>ክትትልዎ እና ማስታወሻዎ ተመዝግበዋል! / Check-In Completed!</b>\n"
@@ -1365,7 +1525,19 @@ async def handle_client_attachments(update: Update, context: ContextTypes.DEFAUL
         try: supabase.table("client_media").insert({"client_id": u.id, "media_type": m_type, "telegram_file_id": f_id, "message_text": update.message.caption or ""}).execute()
         except Exception: pass
 
-        await update.message.reply_text("Got it! 🎥 Your attachment has been saved for ሳይመን's review.", parse_mode="HTML")
+        # FIX: a client uploading a payment receipt is at the highest-anxiety
+        # point of the flow ("did my money go through?"). Give them a
+        # payment-specific confirmation instead of the generic attachment
+        # acknowledgement everyone else gets.
+        if update.message.photo and context.user_data.get("awaiting_payment_screenshot"):
+            await update.message.reply_text(
+                "💳 <b>ክፍያዎ ደርሶናል! / Payment Receipt Received!</b>\n"
+                "ሳይመን በቅርቡ ያረጋግጣል፣ ከተረጋገጠ በኋላ ወዲያውኑ ፓኬጅዎ ይሻሻላል።\n"
+                "<i>Simon will confirm shortly — your package upgrades the moment it's approved.</i>",
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text("Got it! 📎 Your attachment has been saved for ሳይመን's review.", parse_mode="HTML")
 
         if update.message.photo and context.user_data.get("awaiting_payment_screenshot"):
             context.user_data["awaiting_payment_screenshot"] = False
@@ -1411,7 +1583,8 @@ async def handle_admin_tier_approval(update: Update, context: ContextTypes.DEFAU
             "renewal_notified": False,
             "testimonial_notified": False,
         }).eq("id", t_id).execute()
-        msg = f"🎉 <b>Payment Approved!</b>\nUpgraded to <b>{tier}</b>." if await get_client_language(int(t_id)) == "en" else f"🎉 <b>ክፍያዎ ጸድቋል! / Payment Approved!</b>\nመለያዎ ወደ <b>{tier}</b> ከፍ ብሏል። እንኳን ደስ አለዎት!"
+        client_lang = await get_client_language(int(t_id))
+        msg = f"🎉 <b>Payment Approved!</b>\nUpgraded to <b>{tier}</b>." if client_lang == "en" else f"🎉 <b>ክፍያዎ ጸድቋል! / Payment Approved!</b>\nመለያዎ ወደ <b>{display_package(tier, client_lang)}</b> ከፍ ብሏል። እንኳን ደስ አለዎት!"
         await send_message_safely(context, chat_id=int(t_id), text=msg, parse_mode="HTML")
         await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ <b>APPROVED BY ሳይመን</b> ({tier})", parse_mode="HTML")
     except Exception: pass
@@ -1454,6 +1627,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_client_profile, pattern="^get_client_profile$"))
     app.add_handler(CallbackQueryHandler(trigger_daily_checkin, pattern="^start_checkin$"))
     app.add_handler(CallbackQueryHandler(handle_checkin_responses, pattern="^log_"))
+    app.add_handler(CallbackQueryHandler(handle_cancel_checkin, pattern="^cancel_checkin$"))
     app.add_handler(CallbackQueryHandler(handle_language_switch, pattern="^set_lang_"))
 
     app.add_handler(CallbackQueryHandler(handle_upgrade_button, pattern="^upgrade_tier$"))
