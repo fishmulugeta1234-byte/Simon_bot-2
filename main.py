@@ -525,13 +525,14 @@ def first_name(full_name: str) -> str:
     return full_name.strip().split()[0]
 
 
-def build_checkin_grid(log_dates: set, today: date, weeks: int = 2):
+def build_checkin_grid(log_dates: set, today: date, weeks: int = 2, client_since: date | None = None):
     """Builds the Sat→Fri weekly check-in grid used in profile/admin views.
 
     Returns (grid_text, current_streak, adherence_pct). Cells are 🟢 (logged),
-    🔴 (missed — a day that has already passed with no log), or ⚪ (a day
-    that hasn't happened yet). Adherence is green / elapsed-days within the
-    displayed window.
+    🔴 (missed — a day that has already passed with no log), ⚪ (a day
+    that hasn't happened yet), or ⬛ (before the client's `client_since` date,
+    i.e. they weren't enrolled yet — never counted as a miss). Adherence is
+    green / elapsed-days within the displayed window, excluding ⬛ days.
     """
     # Most recent Saturday on/before today starts "this week".
     days_since_saturday = (today.weekday() - 5) % 7
@@ -546,7 +547,9 @@ def build_checkin_grid(log_dates: set, today: date, weeks: int = 2):
         cells = []
         for i in range(7):
             d = week_start + timedelta(days=i)
-            if d > today:
+            if client_since and d < client_since:
+                cells.append("⬛")
+            elif d > today:
                 cells.append("⚪")
             elif d in log_dates:
                 cells.append("🟢")
@@ -733,7 +736,7 @@ async def send_late_night_reminders(context: ContextTypes.DEFAULT_TYPE):
 
 async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
     try:
-        res = supabase.table("clients").select("id, full_name, package, goal").eq("is_active", True).execute()
+        res = supabase.table("clients").select("id, full_name, package, goal, created_at").eq("is_active", True).execute()
         if not res.data: return
         clients = [c for c in res.data if "Meal Plan Only" not in (c.get("package") or "")]
         if not clients: return
@@ -754,7 +757,8 @@ async def send_sunday_admin_report(context: ContextTypes.DEFAULT_TYPE):
         report_lines = ["📥 <b>WEEKLY REVIEW QUEUE FOR SCIENTIFIC SIMON</b>\n"]
         for client in clients:
             log_dates = logs_by_client.get(client["id"], set())
-            grid_text, streak, adherence = build_checkin_grid(log_dates, today_eat, weeks=3)
+            client_since = to_eat_date(client["created_at"])
+            grid_text, streak, adherence = build_checkin_grid(log_dates, today_eat, weeks=3, client_since=client_since)
             report_lines.append(
                 f"<b>{esc(client.get('full_name', 'Client'))}</b> ({esc(client.get('package', 'N/A'))})\n"
                 f"<pre>{esc(grid_text)}</pre>\n"
@@ -886,7 +890,8 @@ async def admin_client_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ).execute()
         log_dates = {to_eat_date(l["created_at"]) for l in (logs_res.data or [])}
         today_eat = datetime.now(EAT_TIMEZONE).date()
-        grid_text, streak, adherence = build_checkin_grid(log_dates, today_eat)
+        client_since = to_eat_date(c["created_at"])
+        grid_text, streak, adherence = build_checkin_grid(log_dates, today_eat, client_since=client_since)
 
         info = (
             f"👤 <b>INFO: {esc(c.get('full_name'))}</b>\n"
@@ -1366,7 +1371,8 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ).execute()
         log_dates = {to_eat_date(l["created_at"]) for l in (logs_res.data or [])}
         today_eat = datetime.now(EAT_TIMEZONE).date()
-        grid_text, streak, adherence = build_checkin_grid(log_dates, today_eat)
+        client_since = to_eat_date(c["created_at"])
+        grid_text, streak, adherence = build_checkin_grid(log_dates, today_eat, client_since=client_since)
 
         pkg_display = display_package(c.get("package"), lang)
 
@@ -1412,6 +1418,12 @@ async def handle_language_switch(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_client_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # FIX: this button previously duplicated /profile with its own,
+    # simpler implementation — a naive "logs in the last 7 days" count
+    # instead of the real consecutive-day streak, and no check-in grid
+    # or adherence %. That meant the button and /profile could show
+    # different numbers for the same client. Now both paths share the
+    # exact same build_checkin_grid() output.
     query = update.callback_query
     await query.answer()
     lang = await get_client_language(query.from_user.id)
@@ -1423,16 +1435,39 @@ async def handle_client_profile(update: Update, context: ContextTypes.DEFAULT_TY
 
         c = res.data[0]
         days = (datetime.now(timezone.utc) - parse_supabase_timestamp(c["created_at"])).days
-        checkins = len(supabase.table("daily_logs").select("id").eq("client_id", c["id"]).gte("created_at", (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()).execute().data or [])
+
+        logs_res = supabase.table("daily_logs").select("created_at").eq("client_id", c["id"]).gte(
+            "created_at", (datetime.now(timezone.utc) - timedelta(days=STREAK_LOOKBACK_DAYS)).isoformat()
+        ).execute()
+        log_dates = {to_eat_date(l["created_at"]) for l in (logs_res.data or [])}
+        today_eat = datetime.now(EAT_TIMEZONE).date()
+        client_since = to_eat_date(c["created_at"])
+        grid_text, streak, adherence = build_checkin_grid(log_dates, today_eat, client_since=client_since)
 
         pkg_display = display_package(c.get("package"), lang)
 
         if lang == "en":
-            text = (f"👤 <b>YOUR COACHING PROFILE</b>\n\n• <b>Name:</b> {esc(c.get('full_name'))}\n• <b>Package:</b> {esc(pkg_display)}\n"
-                    f"• <b>Goal:</b> {esc(c.get('goal'))}\n• <b>Days Active:</b> {days}\n• <b>7-Day Check-ins:</b> {checkins}/7\n")
+            text = (
+                f"👤 <b>YOUR COACHING PROFILE</b>\n\n"
+                f"• <b>Name:</b> {esc(c.get('full_name'))}\n"
+                f"• <b>Package:</b> {esc(pkg_display)}\n"
+                f"• <b>Goal:</b> {esc(c.get('goal'))}\n"
+                f"• <b>Days Active:</b> {days}\n\n"
+                f"📅 <b>CHECK-IN HISTORY</b>\n\n"
+                f"<pre>{esc(grid_text)}</pre>\n"
+                f"📈 {adherence}% adherence this cycle"
+            )
         else:
-            text = (f"👤 <b>የኮቺንግ መለያዎ / YOUR PROFILE</b>\n\n• <b>ስም:</b> {esc(c.get('full_name'))}\n• <b>የፓኬጅ ዓይነት:</b> {esc(pkg_display)}\n"
-                    f"• <b>ዋና ግብ:</b> {esc(c.get('goal'))}\n• <b>የቆይታ ጊዜ:</b> {days} ቀናት\n• <b>የ7 ቀን ክትትል:</b> {checkins}/7 ቀናት\n")
+            text = (
+                f"👤 <b>የኮቺንግ መለያዎ / YOUR PROFILE</b>\n\n"
+                f"• <b>ስም:</b> {esc(c.get('full_name'))}\n"
+                f"• <b>የፓኬጅ ዓይነት:</b> {esc(pkg_display)}\n"
+                f"• <b>ዋና ግብ:</b> {esc(c.get('goal'))}\n"
+                f"• <b>የቆይታ ጊዜ:</b> {days} ቀናት\n\n"
+                f"📅 <b>የክትትል ታሪክ / CHECK-IN HISTORY</b>\n\n"
+                f"<pre>{esc(grid_text)}</pre>\n"
+                f"📈 {adherence}% adherence this cycle"
+            )
         await query.message.reply_text(text, parse_mode="HTML")
     except Exception:
         await query.message.reply_text("⚠️ Error loading profile.")
