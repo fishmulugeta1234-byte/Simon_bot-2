@@ -107,6 +107,41 @@ TIER_CODES = {
 }
 TIER_CODES_REVERSE = {v: k for k, v in TIER_CODES.items()}
 
+# FIX: prices used to be hardcoded directly into the upgrade-menu button
+# labels, so any price change meant editing code and redeploying. Now
+# prices live in a Supabase "pricing" table (tier_name, price_etb,
+# price_usd) and admins can update them live with /setprice. This dict
+# is kept only as a safety fallback — if the table is missing, empty, or
+# a lookup fails for any reason, the bot falls back to these values
+# instead of crashing the upgrade menu.
+FALLBACK_PRICES = {
+    "Kickstart (21 Days)": {"etb": 4500, "usd": 50},
+    "Transformation (60 Days)": {"etb": 8900, "usd": 119},
+    "Elite Transformation (90 Days)": {"etb": 12500, "usd": 159},
+    "Lifestyle Coaching (6 Months)": {"etb": 24000, "usd": 299},
+    "VIP Coaching (6 Months)": {"etb": 39000, "usd": 549},
+}
+
+
+def get_tier_prices() -> dict:
+    """Reads current tier prices from the Supabase "pricing" table.
+
+    Returns {tier_name: {"etb": int, "usd": int}}. Falls back to
+    FALLBACK_PRICES (whole dict, or just a missing tier) if the table
+    read fails or a tier isn't in it yet, so the upgrade menu never
+    breaks even if pricing hasn't been set up or is mid-edit.
+    """
+    prices = dict(FALLBACK_PRICES)
+    try:
+        res = supabase.table("pricing").select("tier_name, price_etb, price_usd").execute()
+        for row in (res.data or []):
+            name = row.get("tier_name")
+            if name:
+                prices[name] = {"etb": row.get("price_etb"), "usd": row.get("price_usd")}
+    except Exception as e:
+        logging.error(f"Error reading pricing table, using fallback prices: {e}")
+    return prices
+
 # FIX: Amharic display names for package tiers, so an Amharic-speaking
 # client doesn't see a raw English tier string dropped into the middle of
 # an otherwise fully localized profile message.
@@ -873,6 +908,48 @@ async def admin_set_package(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Failed: {e}")
 
 
+async def admin_set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles /setprice <tier name> <etb> <usd> — updates a tier's price
+    live in the Supabase "pricing" table, no code deploy needed. Reuses
+    an upsert so it works whether the tier row already exists or not."""
+    if update.effective_user.id not in ADMIN_USER_IDS: return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            f"⚠️ Usage: `/setprice <tier name> <price_etb> <price_usd>`\n"
+            f"Tiers: {', '.join(FALLBACK_PRICES.keys())}\n\n"
+            f"Example: `/setprice Kickstart (21 Days) 4800 55`",
+            parse_mode="HTML"
+        )
+        return
+
+    price_etb_raw, price_usd_raw = context.args[-2], context.args[-1]
+    tier_name = " ".join(context.args[:-2])
+
+    if tier_name not in FALLBACK_PRICES:
+        await update.message.reply_text(f"❌ Invalid Tier Name!\nTiers: {', '.join(FALLBACK_PRICES.keys())}")
+        return
+
+    try:
+        price_etb = int(price_etb_raw)
+        price_usd = int(price_usd_raw)
+    except ValueError:
+        await update.message.reply_text("❌ Prices must be whole numbers, e.g. `/setprice Kickstart (21 Days) 4800 55`")
+        return
+
+    try:
+        supabase.table("pricing").upsert({
+            "tier_name": tier_name,
+            "price_etb": price_etb,
+            "price_usd": price_usd,
+        }).execute()
+        await update.message.reply_text(
+            f"✅ <b>{esc(tier_name)}</b> updated to {price_etb:,} ETB / ${price_usd}.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Failed to update price: {e}")
+
+
 async def admin_client_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_USER_IDS: return
     if not context.args: return
@@ -1520,22 +1597,26 @@ async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logging.error(f"Error checking location_type for upgrade {u_id}: {e}")
 
-    tier_rows_et = [
-        ("Kickstart (21 Days)", "⚡ Kickstart (21 Days) — 4,500 ETB", "upgrade_kickstart"),
-        ("Transformation (60 Days)", "🔥 Transformation (60 Days) — 8,900 ETB", "upgrade_transformation"),
-        ("Elite Transformation (90 Days)", "🥇 Elite (90 Days) — 12,500 ETB", "upgrade_elite"),
-        ("Lifestyle Coaching (6 Months)", "🌟 Lifestyle (6 Months) — 24,000 ETB", "upgrade_lifestyle"),
-        ("VIP Coaching (6 Months)", "👑 VIP Coaching (6 Months) — 39,000 ETB", "upgrade_vip"),
-    ]
-    tier_rows_intl = [
-        ("Kickstart (21 Days)", "⚡ Kickstart (21 Days) — $50", "upgrade_kickstart"),
-        ("Transformation (60 Days)", "🔥 Transformation (60 Days) — $119", "upgrade_transformation"),
-        ("Elite Transformation (90 Days)", "🥇 Elite (90 Days) — $159", "upgrade_elite"),
-        ("Lifestyle Coaching (6 Months)", "🌟 Lifestyle (6 Months) — $299", "upgrade_lifestyle"),
-        ("VIP Coaching (6 Months)", "👑 VIP Coaching (6 Months) — $549", "upgrade_vip"),
+    # FIX: prices used to be hardcoded per-currency into these labels
+    # directly. Now the tier name/emoji/callback stay static here (those
+    # don't change), but the price itself is pulled live from
+    # get_tier_prices() (Supabase "pricing" table, admin-editable via
+    # /setprice) so a price change no longer needs a code deploy.
+    prices = get_tier_prices()
+    tier_meta = [
+        ("Kickstart (21 Days)", "⚡", "Kickstart (21 Days)", "upgrade_kickstart"),
+        ("Transformation (60 Days)", "🔥", "Transformation (60 Days)", "upgrade_transformation"),
+        ("Elite Transformation (90 Days)", "🥇", "Elite (90 Days)", "upgrade_elite"),
+        ("Lifestyle Coaching (6 Months)", "🌟", "Lifestyle (6 Months)", "upgrade_lifestyle"),
+        ("VIP Coaching (6 Months)", "👑", "VIP Coaching (6 Months)", "upgrade_vip"),
     ]
 
-    rows = tier_rows_et if loc_type == "et" else tier_rows_intl
+    def _tier_label(tier_name: str, emoji: str, short_name: str) -> str:
+        p = prices.get(tier_name, FALLBACK_PRICES.get(tier_name, {}))
+        amount = f"{p.get('etb', '?'):,} ETB" if loc_type == "et" else f"${p.get('usd', '?')}"
+        return f"{emoji} {short_name} — {amount}"
+
+    rows = [(tier_name, _tier_label(tier_name, emoji, short_name), cb) for (tier_name, emoji, short_name, cb) in tier_meta]
     keyboard = []
     for (tier_name, label, cb) in rows:
         if tier_name == current_package:
@@ -1931,6 +2012,7 @@ def main():
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("broadcast", admin_broadcast))
     app.add_handler(CommandHandler("setpackage", admin_set_package))
+    app.add_handler(CommandHandler("setprice", admin_set_price))
     app.add_handler(CommandHandler("clientinfo", admin_client_info))
     app.add_handler(CommandHandler("sendplan", admin_send_plan))
     app.add_handler(CommandHandler("reply", admin_send_voice_feedback))
