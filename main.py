@@ -622,7 +622,18 @@ AMHARIC_WEEKDAYS = {
 
 # Grid columns run Sunday → Saturday, expressed as Python .weekday() values
 # (Mon=0 ... Sun=6).
-GRID_HEADER = "     S  M  T  W  T  F  S"
+#
+# FIX: the header used to be a hand-typed string ("     S  M  T  W  T  F  S")
+# that assumed each weekday letter is single-width. But the data rows below
+# it are built from emoji (🟢🔴🟡⚪⬛), which render roughly double-width in
+# Telegram's monospace font — so the plain-letter header drifted out of
+# alignment with the boxes underneath, especially by the later columns.
+# Using full-width Unicode letters (same visual width as an emoji glyph)
+# and assembling the header with the exact same "prefix + single-space-
+# joined cells" pattern used for each week row keeps the two in sync
+# instead of relying on two independently hand-tuned spacing strings.
+_GRID_DAY_LETTERS = ["Ｓ", "Ｍ", "Ｔ", "Ｗ", "Ｔ", "Ｆ", "Ｓ"]
+GRID_HEADER = "     " + " ".join(_GRID_DAY_LETTERS)
 
 
 def bilingual_date_label(d: date) -> str:
@@ -1241,10 +1252,18 @@ async def admin_view_questions(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def admin_view_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /media [photo|voice] [limit]
-    Lists the most recent saved client photos or voice notes, resolved to
-    the client's name, and renders each one inline (mirrors /questions,
-    which only covers media_type == 'text')."""
+    """Usage: /media [photo|voice|video] [limit]
+    Lists the most recent saved client photos, voice notes, or videos,
+    resolved to the client's name, and renders each one inline (mirrors
+    /questions, which only covers media_type == 'text').
+
+    FIX: previously only "photo" and "voice" were valid values for the
+    first argument. /media video silently fell through to the numeric-
+    limit branch, failed int("video") and was swallowed by a bare
+    except, and quietly ran /media photo instead — a check-in video was
+    saved to client_media but had no way to be retrieved. "video" is now
+    accepted the same way photo/voice are.
+    """
     if update.effective_user.id not in ADMIN_USER_IDS:
         return
 
@@ -1252,7 +1271,7 @@ async def admin_view_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     limit = 10
     args = context.args or []
     if len(args) >= 1:
-        if args[0].lower() in ("photo", "voice"):
+        if args[0].lower() in ("photo", "voice", "video"):
             media_type = args[0].lower()
             if len(args) >= 2:
                 try:
@@ -1283,7 +1302,8 @@ async def admin_view_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         names_res = supabase.table("clients").select("id, full_name").in_("id", client_ids).execute()
         name_map = {c["id"]: c.get("full_name", "Unknown") for c in (names_res.data or [])}
 
-        icon = "📸" if media_type == "photo" else "🎙️"
+        # FIX: "video" now supported alongside "photo"/"voice" (see docstring above).
+        icon = "📸" if media_type == "photo" else ("🎙️" if media_type == "voice" else "🎥")
         await update.message.reply_text(f"{icon} <b>RECENT CLIENT {media_type.upper()}S (last {len(rows)})</b>", parse_mode="HTML")
 
         for r in rows:
@@ -1300,8 +1320,10 @@ async def admin_view_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 if media_type == "photo":
                     await context.bot.send_photo(chat_id=update.effective_chat.id, photo=r["telegram_file_id"], caption=caption, parse_mode="HTML")
-                else:
+                elif media_type == "voice":
                     await context.bot.send_voice(chat_id=update.effective_chat.id, voice=r["telegram_file_id"], caption=caption, parse_mode="HTML")
+                else:
+                    await context.bot.send_video(chat_id=update.effective_chat.id, video=r["telegram_file_id"], caption=caption, parse_mode="HTML")
             except Exception as send_err:
                 logging.error(f"Failed to render {media_type} row for admin: {send_err}")
                 await update.message.reply_text(caption, parse_mode="HTML")
