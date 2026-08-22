@@ -649,26 +649,6 @@ def first_name(full_name: str) -> str:
     return full_name.strip().split()[0]
 
 
-def _week_date_row(week_start: date) -> str:
-    """Zero-padded day-of-month numbers for one week, one per column,
-    laid out with the exact same '5-space prefix + single-space-joined
-    cells' pattern as GRID_HEADER and each 'WkN:' row — so this line
-    sits directly above the emoji row it labels and stays in step with
-    the weekday-letter header above it.
-
-    FIX: two-digit ASCII day numbers (zero-padded, e.g. "05", "21") are
-    used rather than full-width digits. Full-width glyphs render at
-    roughly double the width of an ASCII character (matching a single
-    emoji cell), so a full-width two-digit number would span ~4 cells —
-    wider than the emoji box it's meant to label — and push every column
-    after it out of alignment. Zero-padded ASCII digits stay ~2 cells
-    wide, matching a single emoji's footprint, so each date lines up
-    directly above its own box.
-    """
-    day_nums = [f"{(week_start + timedelta(days=i)).day:02d}" for i in range(7)]
-    return "     " + " ".join(day_nums)
-
-
 def build_checkin_grid(log_dates: set, today: date, weeks: int = 2, client_since: date | None = None):
     """Builds the Sunday→Saturday weekly check-in grid used in profile/admin views.
 
@@ -686,11 +666,6 @@ def build_checkin_grid(log_dates: set, today: date, weeks: int = 2, client_since
 
     Adherence is green / elapsed-days within the displayed window,
     excluding ⬛ (pre-enrollment), ⚪ (future), and 🟡 (today, pending).
-
-    FIX: each week's emoji row is now preceded by its own date-number row
-    (e.g. "17 18 19 20 21 22 23") from _week_date_row(), so every box in
-    the grid can be read directly against the calendar date it represents
-    instead of only the generic weekday letters at the very top.
     """
     # Most recent Sunday on/before today starts "this week".
     # Python weekday(): Monday=0 ... Sunday=6.
@@ -724,7 +699,6 @@ def build_checkin_grid(log_dates: set, today: date, weeks: int = 2, client_since
             else:
                 cells.append("🔴")
                 elapsed += 1
-        rows.append(_week_date_row(week_start))
         rows.append(f"Wk{w + 1}: " + " ".join(cells))
 
     streak = compute_current_streak(log_dates, today)
