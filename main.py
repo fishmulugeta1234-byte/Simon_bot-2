@@ -35,6 +35,11 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 ADMIN_USER_IDS = [1622298145, 389487101]
 
+# FIX: username of the separate onboarding/registration bot. Anyone who
+# messages THIS bot without an existing row in `clients` gets redirected
+# here via a button instead of being allowed to poke around commands.
+REGISTRATION_BOT_USERNAME = "Simonorigin_bot"
+
 for _name, _val in [("BOT_TOKEN", BOT_TOKEN), ("SUPABASE_URL", SUPABASE_URL), ("SUPABASE_KEY", SUPABASE_KEY)]:
     if not _val:
         raise RuntimeError(f"Missing required environment variable: {_name}")
@@ -481,6 +486,80 @@ async def get_client_language(user_id: int) -> str:
     return "am"
 
 
+# ------------------------------------------------------------------
+# REGISTRATION GATEKEEPER
+# ------------------------------------------------------------------
+# NEW: anyone who talks to this bot without an existing row in `clients`
+# (i.e. they never went through the separate onboarding/registration bot)
+# gets redirected there instead of being able to poke at commands,
+# check-ins, or the menu.
+def build_registration_prompt():
+    """Bilingual 'please register first' message + a URL button that
+    deep-links straight into the onboarding bot. A URL button (not a
+    callback) so it works even for someone with zero prior interaction."""
+    text = (
+        "🔒 <b>እስካሁን አልተመዘገቡም! / You're not registered yet!</b>\n\n"
+        "ይህ ቦት ምዝገባቸውን ላጠናቀቁ ደንበኞች ብቻ የተዘጋጀ ነው። እባክዎ መጀመሪያ ከታች ባለው ቁልፍ ይመዝገቡ፣ "
+        "ከዚያ ወደዚህ ተመልሰው ይምጡ!\n"
+        "<i>This bot is only for clients who've completed sign-up. Please register "
+        "using the button below first, then come back here.</i>"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 ይመዝገቡ / Register Here", url=f"https://t.me/{REGISTRATION_BOT_USERNAME}")]
+    ])
+    return text, markup
+
+
+async def is_registered(user_id: int) -> bool:
+    """True if a `clients` row exists for this Telegram user id at all —
+    independent of `plan_ready` (which only gates whether their plan is
+    built yet, for people who ARE registered).
+
+    On a DB error we fail OPEN (treat as registered) rather than locking
+    out real clients over a transient Supabase hiccup — same defensive
+    posture used elsewhere in this file (e.g. start_command's gatekeeper
+    try/except). Worst case on a DB error is a not-yet-registered visitor
+    briefly sees normal bot behavior instead of the registration prompt.
+    """
+    try:
+        res = supabase.table("clients").select("id").eq("id", user_id).limit(1).execute()
+        return bool(res.data)
+    except Exception as e:
+        logging.error(f"Registration check failed for {user_id}: {e}")
+        return True
+
+
+async def guard_registered_message(update: Update) -> bool:
+    """Gate for command/message entry points. Returns True and does
+    nothing if the caller is registered. Returns False (after sending the
+    registration prompt as a reply) if they aren't — caller should return
+    immediately."""
+    user = update.effective_user
+    if not user:
+        return False
+    if await is_registered(user.id):
+        return True
+    text, markup = build_registration_prompt()
+    await update.message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+    return False
+
+
+async def guard_registered_callback(update: Update) -> bool:
+    """Same as guard_registered_message, but for callback-query (button)
+    entry points — edits the existing message instead of sending a new
+    one, falling back to a reply if the edit fails for any reason."""
+    query = update.callback_query
+    user = query.from_user
+    if await is_registered(user.id):
+        return True
+    text, markup = build_registration_prompt()
+    try:
+        await query.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        await query.message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+    return False
+
+
 def parse_supabase_timestamp(ts: str) -> datetime:
     normalized = ts.replace("Z", "+00:00")
     dt = datetime.fromisoformat(normalized)
@@ -562,11 +641,20 @@ def first_name(full_name: str) -> str:
 def build_checkin_grid(log_dates: set, today: date, weeks: int = 2, client_since: date | None = None):
     """Builds the Sunday→Saturday weekly check-in grid used in profile/admin views.
 
-    Returns (grid_text, current_streak, adherence_pct). Cells are 🟢 (logged),
-    🔴 (missed — a day that has already passed with no log), ⚪ (a day
-    that hasn't happened yet), or ⬛ (before the client's `client_since` date,
-    i.e. they weren't enrolled yet — never counted as a miss). Adherence is
-    green / elapsed-days within the displayed window, excluding ⬛ days.
+    Returns (grid_text, current_streak, adherence_pct). Cells are:
+      🟢 logged
+      🔴 missed — a day that has already fully passed with no log
+      🟡 today, pending — today hasn't ended yet and no log exists yet
+         (FIX: today used to render 🔴 the instant midnight hit, even
+         mid-morning before the client had a chance to check in, which
+         reads as "you already failed today." 🟡 distinguishes "still
+         time to log this" from an actual miss, and — like ⚪ — is NOT
+         counted in the adherence % below, since the day isn't over.)
+      ⚪ a future day that hasn't happened yet
+      ⬛ before the client's `client_since` date — never counted as a miss
+
+    Adherence is green / elapsed-days within the displayed window,
+    excluding ⬛ (pre-enrollment), ⚪ (future), and 🟡 (today, pending).
     """
     # Most recent Sunday on/before today starts "this week".
     # Python weekday(): Monday=0 ... Sunday=6.
@@ -586,6 +674,13 @@ def build_checkin_grid(log_dates: set, today: date, weeks: int = 2, client_since
                 cells.append("⬛")
             elif d > today:
                 cells.append("⚪")
+            elif d == today:
+                if d in log_dates:
+                    cells.append("🟢")
+                    elapsed += 1
+                    green += 1
+                else:
+                    cells.append("🟡")  # pending — day isn't over, not a miss yet
             elif d in log_dates:
                 cells.append("🟢")
                 elapsed += 1
@@ -1346,7 +1441,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         res = supabase.table("clients").select("plan_ready, language").eq("id", user_id).execute()
-        if res.data and len(res.data) > 0:
+        client_exists = bool(res.data)
+        if client_exists:
             client_record = res.data[0]
             plan_is_ready = client_record.get("plan_ready", False)
             lang = client_record.get("language", "am")
@@ -1355,8 +1451,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lang = "am"
     except Exception as e:
         logging.error(f"Gatekeeper check error for {user_id}: {e}")
+        # Can't confirm registration status on a DB error — fail toward
+        # "registered but not ready yet" rather than turning away someone
+        # who's actually a real client just because Supabase hiccuped.
+        client_exists = True
         plan_is_ready = False
         lang = "am"
+
+    # NEW: no client row at all -> not registered -> send to the
+    # onboarding bot instead of the "your plan is being built" message.
+    if not client_exists:
+        text, markup = build_registration_prompt()
+        await update.message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+        return
 
     if not plan_is_ready:
         if lang == "am":
@@ -1396,6 +1503,8 @@ async def checkin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return
+    if not await guard_registered_message(update):
+        return
 
     today_eat = datetime.now(EAT_TIMEZONE).date()
     try:
@@ -1429,6 +1538,8 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /profile text command to display client details."""
     user = update.effective_user
     if not user:
+        return
+    if not await guard_registered_message(update):
         return
 
     lang = await get_client_language(user.id)
@@ -1503,6 +1614,8 @@ async def handle_client_profile(update: Update, context: ContextTypes.DEFAULT_TY
     # exact same build_checkin_grid() output.
     query = update.callback_query
     await query.answer()
+    if not await guard_registered_callback(update):
+        return
     lang = await get_client_language(query.from_user.id)
     try:
         res = supabase.table("clients").select("*").eq("id", query.from_user.id).execute()
@@ -1553,6 +1666,8 @@ async def handle_client_profile(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_target_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if not await guard_registered_callback(update):
+        return
     lang = await get_client_language(query.from_user.id)
     try:
         res = supabase.table("clients").select("*").eq("id", query.from_user.id).execute()
@@ -1582,6 +1697,8 @@ async def handle_target_plan(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if not await guard_registered_callback(update):
+        return
     u_id = query.from_user.id
 
     context.user_data.pop("pending_tier", None)
@@ -1641,6 +1758,8 @@ async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_upgrade_payment_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if not await guard_registered_callback(update):
+        return
     u_id = query.from_user.id
 
     loc_type = "et"
@@ -1690,6 +1809,8 @@ async def trigger_daily_checkin(update: Update, context: ContextTypes.DEFAULT_TY
     message on top of it."""
     query = update.callback_query
     await query.answer()
+    if not await guard_registered_callback(update):
+        return
     u_id = query.from_user.id
     today_eat = datetime.now(EAT_TIMEZONE).date()
 
@@ -1725,6 +1846,8 @@ async def handle_checkin_responses(update: Update, context: ContextTypes.DEFAULT
     Step 1/3 → 2/3 → 3/3) rather than sending a fresh bubble each time."""
     query = update.callback_query
     await query.answer()
+    if not await guard_registered_callback(update):
+        return
     u_id = query.from_user.id
     today_eat = datetime.now(EAT_TIMEZONE).date()
 
@@ -1815,6 +1938,13 @@ async def handle_cancel_checkin(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_client_attachments(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not u or not update.message: return
+
+    # NEW: gate the catch-all handler too — this is the biggest surface
+    # area (any text/photo/voice/video from anyone), so an unregistered
+    # visitor rambling into the chat gets redirected instead of silently
+    # having their message saved to client_media.
+    if not await guard_registered_message(update):
+        return
 
     if context.user_data.get("awaiting_checkin_note"):
         started_raw = context.user_data.get("awaiting_checkin_note_started_at")
